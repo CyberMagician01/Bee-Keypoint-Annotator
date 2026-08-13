@@ -6,7 +6,7 @@
 
 ## 获取软件
 
-普通使用者建议从 GitHub Releases 下载 `蜜蜂关键点标注器.zip`，完整解压后双击 `蜜蜂关键点标注器.exe`，无需安装 Python。
+普通使用者建议从 GitHub Releases 下载 `Bee-Keypoint-Annotator-v1.7.4-Windows.zip`，完整解压后双击 `蜜蜂关键点标注器.exe`，无需安装 Python。
 
 ## 从源码运行
 
