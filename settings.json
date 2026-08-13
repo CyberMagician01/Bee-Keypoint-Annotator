@@ -1,0 +1,120 @@
+{
+  "labels": [
+    "head",
+    "tail"
+  ],
+  "symmetry_source_label": "head",
+  "symmetry_target_label": "tail",
+  "symmetry_enabled": true,
+  "symmetry_ratio": 0.4533,
+  "show_label_names": false,
+  "show_other_boxes": true,
+  "iou_threshold": 0.5,
+  "shortcuts": {
+    "previous_image": [
+      "Z",
+      "无"
+    ],
+    "next_image": [
+      "C",
+      "无"
+    ],
+    "previous_rectangle": [
+      "Q",
+      "鼠标侧键1"
+    ],
+    "next_rectangle": [
+      "E",
+      "鼠标侧键2"
+    ],
+    "select_label_1": [
+      "1",
+      "无"
+    ],
+    "select_label_2": [
+      "2",
+      "无"
+    ],
+    "toggle_symmetry": [
+      "Ctrl+M",
+      "无"
+    ],
+    "save": [
+      "Ctrl+S",
+      "无"
+    ],
+    "undo": [
+      "Ctrl+Z",
+      "无"
+    ],
+    "delete_label_point": [
+      "Delete",
+      "无"
+    ],
+    "delete_all_points": [
+      "Shift+Delete",
+      "无"
+    ],
+    "open_folder": [
+      "Ctrl+O",
+      "无"
+    ],
+    "open_iou": [
+      "Ctrl+I",
+      "无"
+    ],
+    "open_label_manager": [
+      "Ctrl+L",
+      "无"
+    ],
+    "open_shortcut_manager": [
+      "Ctrl+K",
+      "无"
+    ],
+    "open_help": [
+      "F1",
+      "无"
+    ],
+    "toggle_label_names": [
+      "Ctrl+T",
+      "无"
+    ],
+    "toggle_other_boxes": [
+      "Ctrl+B",
+      "无"
+    ],
+    "previous_track_frame": [
+      "A",
+      "无"
+    ],
+    "next_track_frame": [
+      "D",
+      "无"
+    ],
+    "copy_frame_to_next": [
+      "R",
+      "无"
+    ],
+    "propagate_track": [
+      "Ctrl+P",
+      "无"
+    ],
+    "confirm_keypoints": [
+      "Space",
+      "无"
+    ],
+    "swap_head_tail": [
+      "X",
+      "无"
+    ],
+    "next_review_issue": [
+      "N",
+      "无"
+    ],
+    "open_frame_table": [
+      "G",
+      "无"
+    ]
+  },
+  "default_folder": "C:\\BeeAnnotationData"
+}
