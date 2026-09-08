@@ -1,5 +1,7 @@
 # 蜜蜂关键点标注器
 
+由我们团队自主开发并开源的蜜蜂标注与人工复核软件，采用 [MIT 许可证](./LICENSE)。
+
 面向蜜蜂 `head` / `tail` 关键点标注与复审的 Windows 桌面工具。软件直接读取 X-AnyLabeling / LabelMe JSON 中已有的检测框，支持 Track ID 复审、关键点传播、中心对称辅助和检测框调整。
 
 当前版本：`v1.7.4`
@@ -65,3 +67,13 @@ JSON 中应包含矩形检测框；如果需要按轨迹复审，矩形还应带
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+## 团队工具与数据飞轮
+
+本工具用于头尾关键点补标、方向复核和同 ID 跨帧检查；身份合并与轨迹逐条复查可配合团队开发的 [蜜蜂 Track ID 修正器](https://github.com/CyberMagician01/Bee-TrackID-Corrector)。两者支持人工修正模型候选，修正后的标注可交回数据飞轮汇总。
+
+## 开源许可与依赖
+
+本仓库的软件源码及随附说明采用 [MIT 许可证](./LICENSE)，欢迎复用、修改和贡献改进。软件通过 JSON 格式与 X-AnyLabeling、LabelMe 交换标注，这两个外部项目各自由其开发者维护。
+
+界面使用 Python 标准库 Tkinter，图像处理使用 Pillow，Windows 集成功能使用 pywin32；第三方依赖遵循各自许可证。比赛原视频、任务图像和标注数据由各自的数据授权管理，不随软件许可证开放。
