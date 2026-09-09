@@ -4,11 +4,11 @@
 
 面向蜜蜂 `head` / `tail` 关键点标注与复审的 Windows 桌面工具。软件直接读取 X-AnyLabeling / LabelMe JSON 中已有的检测框，支持 Track ID 复审、关键点传播、中心对称辅助和检测框调整。
 
-当前版本：`v1.7.4`
+当前版本：`v1.8.18`
 
 ## 获取软件
 
-普通使用者建议从 GitHub Releases 下载 `Bee-Keypoint-Annotator-v1.7.4-Windows.zip`，完整解压后双击 `蜜蜂关键点标注器.exe`，无需安装 Python。
+普通使用者建议从 GitHub Releases 下载 `Bee-Keypoint-Annotator-v1.8.18-Windows.zip`，完整解压后双击 `蜜蜂关键点标注器.exe`，无需安装 Python。
 
 ## 从源码运行
 

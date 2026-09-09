@@ -10,8 +10,21 @@ import queue
 import sys
 import threading
 import time
-import tkinter as tk
 from pathlib import Path
+
+# PyInstaller 的自动 Tcl/Tk 定位在微信深层中文目录中可能失效。
+# 在导入 tkinter 前明确指向随程序发布的运行库。
+if getattr(sys, "frozen", False):
+    _runtime_dir = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    for _variable, _folder in (
+        ("TCL_LIBRARY", "_tcl_data"),
+        ("TK_LIBRARY", "_tk_data"),
+    ):
+        _candidate = _runtime_dir / _folder
+        if _candidate.is_dir():
+            os.environ[_variable] = str(_candidate)
+
+import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from typing import Dict, List, Optional, Tuple
 
@@ -25,22 +38,31 @@ except ImportError:
     win32gui = None
 
 from annotation_io import (
+    DIRECTION_REVIEW_REQUIRED_FLAG,
     REVIEW_REQUIRED_FLAG,
+    add_rectangle,
     add_or_replace_point,
     apply_transfer_plan,
     build_next_frame_transfer_plan,
     build_trackid_transfer_plan,
     build_transfer_plan,
+    change_rectangle_group_id,
     collect_point_labels,
+    confirm_direction_review_for_rectangle,
     confirm_keypoints_for_rectangle,
+    copy_rectangle_with_keypoints,
     delete_nearest_point,
     delete_points,
+    delete_rectangle_with_keypoints,
+    direction_review_metadata,
     keypoints_by_rectangle,
     keypoints_for_rectangle,
     load_document,
     point_is_suggested,
     point_records,
     rectangle_records,
+    rectangle_direction_review_is_pending,
+    rectangle_is_direction_review_item,
     rectangle_review_is_pending,
     rename_point_label,
     review_progress,
@@ -50,6 +72,7 @@ from annotation_io import (
 )
 from core import (
     adjust_rectangle_bounds,
+    direction_angle_degrees,
     point_from_relative,
     point_in_rect,
     rect_area,
@@ -114,6 +137,9 @@ ACTION_DEFINITIONS = [
     ("open_shortcut_manager", "打开快捷键设置", ("Ctrl+K", "无")),
     ("open_help", "打开帮助", ("F1", "无")),
     ("toggle_label_names", "显示/隐藏标签名", ("Ctrl+T", "无")),
+    ("toggle_track_ids", "显示/隐藏检测框 ID", ("B", "无")),
+    ("toggle_bee_shadow_class", "切换 bee / beeshadow", ("F", "无")),
+    ("toggle_box_class_labels", "显示/隐藏框类别", ("Y", "无")),
     ("toggle_other_boxes", "显示/隐藏其他框", ("Ctrl+B", "无")),
     ("previous_track_frame", "同 ID 上一次出现", ("A", "无")),
     ("next_track_frame", "同 ID 下一次出现", ("D", "无")),
@@ -121,6 +147,9 @@ ACTION_DEFINITIONS = [
     ("copy_frame_to_next", "整帧关键点复制到下一张", ("R", "无")),
     ("propagate_track", "按 Track ID 传播", ("Ctrl+P", "无")),
     ("confirm_keypoints", "确认当前关键点", ("Space", "无")),
+    ("start_continuous_annotation", "进入连续补标/切换下一个 ID", ("V", "无")),
+    ("clear_default_track_id", "清除默认 Track ID", ("无", "无")),
+    ("toggle_continuous_other_boxes", "显示/隐藏全部检测框", ("H", "无")),
     ("swap_head_tail", "交换 head/tail", ("X", "无")),
     ("next_review_issue", "下一待审/异常", ("N", "无")),
     ("open_frame_table", "打开本帧框清单", ("G", "无")),
@@ -132,8 +161,50 @@ DEFAULT_SHORTCUTS = {
 }
 
 
+class TrackIdQueryDialog(simpledialog._QueryInteger):
+    """与 Track ID 修正器一致：除回车外，也可按 G 确认。"""
+
+    def body(self, master):
+        entry = super().body(master)
+        entry.bind("<g>", self._confirm_with_g)
+        entry.bind("<G>", self._confirm_with_g)
+        return entry
+
+    def _confirm_with_g(self, _event):
+        self.ok()
+        return "break"
+
+
+class TrackIdChangeDialog(TrackIdQueryDialog):
+    """输入新 ID，并选择修改当前帧、此前或此后的同轨迹框。"""
+
+    def body(self, master):
+        entry = super().body(master)
+        self.scope_var = tk.StringVar(value="current")
+        ttk.Label(master, text="修改范围：").grid(
+            row=2, column=0, columnspan=2, sticky=tk.W, pady=(10, 2)
+        )
+        choices = (
+            ("仅修改当前帧", "current"),
+            ("当前帧及此前所有相同旧 ID", "before"),
+            ("当前帧及此后所有相同旧 ID", "after"),
+        )
+        for row, (label, value) in enumerate(choices, start=3):
+            ttk.Radiobutton(
+                master,
+                text=label,
+                variable=self.scope_var,
+                value=value,
+            ).grid(row=row, column=0, columnspan=2, sticky=tk.W)
+        return entry
+
+    def apply(self):
+        self.selected_scope = self.scope_var.get()
+        super().apply()
+
+
 class BeeKeypointAnnotator:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, initial_folder: Optional[Path] = None) -> None:
         self.root = root
         self.root.title("蜜蜂关键点标注器")
         self.root.geometry("1520x900")
@@ -203,6 +274,12 @@ class BeeKeypointAnnotator:
         self.show_label_names = tk.BooleanVar(
             value=bool(self.settings.get("show_label_names", False))
         )
+        self.show_track_ids = tk.BooleanVar(
+            value=bool(self.settings.get("show_track_ids", True))
+        )
+        self.show_box_class_labels = tk.BooleanVar(
+            value=bool(self.settings.get("show_box_class_labels", False))
+        )
         self.show_other_boxes = tk.BooleanVar(
             value=bool(self.settings.get("show_other_boxes", True))
         )
@@ -210,7 +287,11 @@ class BeeKeypointAnnotator:
         self.status_var = tk.StringVar(value="请选择数据文件夹")
         self.progress_var = tk.StringVar(value="")
         self.points_var = tk.StringVar(value="")
+        self.direction_review_summary_var = tk.StringVar(value="")
         self.confirmation_progress = tk.DoubleVar(value=0.0)
+        self.default_track_id_text = tk.StringVar(value="")
+        self.default_track_id_status_var = tk.StringVar(value="默认 ID：未启用")
+        self.max_track_id_var = tk.StringVar(value="任务最大 ID：—")
 
         self.folder: Optional[Path] = None
         self.images: List[Path] = []
@@ -224,10 +305,13 @@ class BeeKeypointAnnotator:
         self.current_pil_image: Optional[Image.Image] = None
         self.track_id_mode = False
         self.track_mode_current_id = None
+        self.direction_review_mode = False
+        self.direction_review_item_index = -1
         self.track_completion_dialog = None
         self.refresh_track_stats = None
 
         self.overview_photo = None
+        self.direction_review_photo = None
         self.detail_photo = None
         self.overview_transform: Optional[Tuple[float, float, float]] = None
         self.detail_transform: Optional[Tuple[float, float, float]] = None
@@ -238,6 +322,16 @@ class BeeKeypointAnnotator:
         self.redraw_job = None
         self.autosave_job = None
         self.rectangle_drag = None
+        self.middle_pan = None
+        self.detail_view_centers: Dict[Tuple[Path, int], Tuple[float, float]] = {}
+        self.default_track_id = None
+        self.default_track_id_explicit = False
+        self.rectangle_creation = None
+        self.continuous_annotation_mode = False
+        self.continuous_active_track_id = None
+        self.continuous_draw_box_mode = False
+        self.continuous_focus_point = None
+        self.continuous_zoom_factor = 3.0
         self.pointer_press = None
         self.frame_completion_state: Dict[Path, bool] = {}
 
@@ -246,9 +340,12 @@ class BeeKeypointAnnotator:
         self._bind_shortcuts()
         self._install_native_mouse_buttons()
         self.root.after(300, self._ensure_native_mouse_buttons)
+        self.root.after(450, self._balance_main_pane)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        configured_folder = Path(self.settings.get("default_folder", str(DEFAULT_FOLDER)))
+        configured_folder = initial_folder or Path(
+            self.settings.get("default_folder", str(DEFAULT_FOLDER))
+        )
         initial_folder = configured_folder if configured_folder.exists() else DEFAULT_FOLDER
         if initial_folder.exists():
             self.load_folder(initial_folder)
@@ -284,6 +381,8 @@ class BeeKeypointAnnotator:
             "symmetry_enabled": False,
             "symmetry_ratio": 1.0,
             "show_label_names": False,
+            "show_track_ids": True,
+            "show_box_class_labels": False,
             "show_other_boxes": True,
             "iou_threshold": 0.5,
             "long_press_delay_ms": DEFAULT_LONG_PRESS_DELAY_MS,
@@ -354,6 +453,19 @@ class BeeKeypointAnnotator:
             ["P", "无"],
         ):
             shortcuts["copy_frame_to_next"] = ["R", "无"]
+
+        # B 现在专门控制检测框 ID；旧版清除默认 ID 仍保留按钮操作。
+        if configured.get("toggle_track_ids") is None:
+            shortcuts["toggle_track_ids"] = ["B", "无"]
+            if configured.get("clear_default_track_id") in (
+                "V",
+                "B",
+                ["V"],
+                ["B"],
+                ["V", "无"],
+                ["B", "无"],
+            ):
+                shortcuts["clear_default_track_id"] = ["无", "无"]
         return shortcuts
 
     def _save_settings(self) -> None:
@@ -365,6 +477,8 @@ class BeeKeypointAnnotator:
                 "symmetry_enabled": self.symmetry_enabled.get(),
                 "symmetry_ratio": round(self.symmetry_ratio.get(), 4),
                 "show_label_names": self.show_label_names.get(),
+                "show_track_ids": self.show_track_ids.get(),
+                "show_box_class_labels": self.show_box_class_labels.get(),
                 "show_other_boxes": self.show_other_boxes.get(),
                 "long_press_delay_ms": self.long_press_delay_ms,
                 "shortcuts": self.shortcuts,
@@ -768,13 +882,13 @@ class BeeKeypointAnnotator:
             text="  01  当前检测框｜精确标注  ",
             style="Workspace.TLabelframe",
         )
-        overview_frame = ttk.LabelFrame(
+        self.overview_frame = ttk.LabelFrame(
             self.main_pane,
             text="  02  整图鸟瞰｜选择目标  ",
             style="Workspace.TLabelframe",
         )
         self.main_pane.add(detail_frame, weight=11)
-        self.main_pane.add(overview_frame, weight=10)
+        self.main_pane.add(self.overview_frame, weight=10)
 
         self.detail_canvas = tk.Canvas(
             detail_frame,
@@ -800,12 +914,14 @@ class BeeKeypointAnnotator:
             "<ButtonRelease-1>",
             lambda event: self._on_pointer_release(event, "detail"),
         )
-        self.detail_canvas.bind("<Button-2>", self._on_detail_middle_click)
+        self.detail_canvas.bind("<ButtonPress-2>", self._on_detail_middle_press)
+        self.detail_canvas.bind("<B2-Motion>", self._on_detail_middle_motion)
+        self.detail_canvas.bind("<ButtonRelease-2>", self._on_detail_middle_release)
         self.detail_canvas.bind("<Button-3>", self._on_detail_right_click)
         self.detail_canvas.bind("<MouseWheel>", self._on_detail_wheel)
 
         self.overview_canvas = tk.Canvas(
-            overview_frame,
+            self.overview_frame,
             background=COLORS["canvas"],
             highlightthickness=0,
             cursor="hand2",
@@ -827,6 +943,58 @@ class BeeKeypointAnnotator:
         self.overview_canvas.bind(
             "<ButtonRelease-1>",
             lambda event: self._on_pointer_release(event, "overview"),
+        )
+        self.overview_canvas.bind("<MouseWheel>", self._on_continuous_zoom_wheel)
+
+        self.direction_review_panel = ttk.Frame(
+            self.overview_frame,
+            style="Toolbar.TFrame",
+            padding=(8, 7),
+        )
+        review_summary = ttk.Frame(
+            self.direction_review_panel,
+            style="Toolbar.TFrame",
+        )
+        review_summary.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(
+            review_summary,
+            text="方向复审清单",
+            style="Section.TLabel",
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            review_summary,
+            textvariable=self.direction_review_summary_var,
+            style="StatusStrong.TLabel",
+        ).pack(side=tk.RIGHT)
+        review_table = ttk.Frame(self.direction_review_panel)
+        review_table.pack(fill=tk.BOTH, expand=True)
+        self.direction_review_tree = ttk.Treeview(
+            review_table,
+            columns=("status", "scene", "frame", "track"),
+            show="headings",
+            height=6,
+            selectmode="browse",
+        )
+        for column, title, width in (
+            ("status", "状态", 72),
+            ("scene", "场景", 72),
+            ("frame", "帧号", 86),
+            ("track", "Track ID", 88),
+        ):
+            self.direction_review_tree.heading(column, text=title)
+            self.direction_review_tree.column(column, width=width, anchor=tk.CENTER)
+        review_scrollbar = ttk.Scrollbar(
+            review_table,
+            orient=tk.VERTICAL,
+            command=self.direction_review_tree.yview,
+        )
+        self.direction_review_tree.configure(yscrollcommand=review_scrollbar.set)
+        self.direction_review_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        review_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.direction_review_tree.tag_configure("pending", foreground="#C97700")
+        self.direction_review_tree.tag_configure("reviewed", foreground="#1F9D75")
+        self.direction_review_tree.bind(
+            "<Double-1>", self._on_direction_review_tree_double_click
         )
 
         controls = ttk.Frame(self.root, padding=(12, 0, 12, 6))
@@ -869,6 +1037,15 @@ class BeeKeypointAnnotator:
             command=self.open_frame_table,
         )
         self.frame_table_button.pack(side=tk.LEFT, padx=2)
+        self.toggle_class_button = ttk.Button(
+            controls,
+            text=self._action_button_text(
+                "bee ↔ beeshadow", "toggle_bee_shadow_class"
+            ),
+            style="Accent.TButton",
+            command=self.toggle_current_bee_shadow_class,
+        )
+        self.toggle_class_button.pack(side=tk.LEFT, padx=(10, 2))
         ttk.Checkbutton(
             controls,
             text="显示标签名",
@@ -878,7 +1055,75 @@ class BeeKeypointAnnotator:
         ).pack(side=tk.RIGHT, padx=5)
         ttk.Checkbutton(
             controls,
-            text="显示其他框",
+            text="显示框 ID（B）",
+            style="Tool.TCheckbutton",
+            variable=self.show_track_ids,
+            command=self._refresh_all,
+        ).pack(side=tk.RIGHT, padx=5)
+
+        creation_controls = ttk.Frame(
+            self.root,
+            style="Toolbar.TFrame",
+            padding=(12, 7),
+        )
+        creation_controls.pack(fill=tk.X)
+        ttk.Label(
+            creation_controls,
+            text="新增检测框",
+            style="Section.TLabel",
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.continuous_mode_button = ttk.Button(
+            creation_controls,
+            text=self._action_button_text(
+                "连续补标", "start_continuous_annotation"
+            ),
+            style="Primary.TButton",
+            command=self.start_continuous_annotation_mode,
+        )
+        self.continuous_mode_button.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(creation_controls, text="默认 Track ID：").pack(side=tk.LEFT)
+        self.default_track_id_combo = ttk.Combobox(
+            creation_controls,
+            textvariable=self.default_track_id_text,
+            width=9,
+            state="normal",
+        )
+        self.default_track_id_combo.pack(side=tk.LEFT, padx=(2, 5))
+        self.default_track_id_combo.bind(
+            "<Return>", self._activate_default_track_id_from_entry
+        )
+        self.default_track_id_combo.bind(
+            "<KP_Enter>", self._activate_default_track_id_from_entry
+        )
+        self.default_track_id_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self.activate_default_track_id()
+        )
+        self.activate_default_track_id_button = ttk.Button(
+            creation_controls,
+            text="启用 / 更新",
+            style="Primary.TButton",
+            command=self.activate_default_track_id,
+        )
+        self.activate_default_track_id_button.pack(side=tk.LEFT, padx=2)
+        self.clear_default_track_id_button = ttk.Button(
+            creation_controls,
+            text=self._action_button_text("清除默认 ID", "clear_default_track_id"),
+            command=self.clear_default_track_id,
+        )
+        self.clear_default_track_id_button.pack(side=tk.LEFT, padx=(2, 10))
+        ttk.Label(
+            creation_controls,
+            textvariable=self.default_track_id_status_var,
+            style="Muted.TLabel",
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Label(
+            creation_controls,
+            textvariable=self.max_track_id_var,
+            style="Section.TLabel",
+        ).pack(side=tk.RIGHT, padx=5)
+        ttk.Checkbutton(
+            controls,
+            text="显示全部框",
             style="Tool.TCheckbutton",
             variable=self.show_other_boxes,
             command=self._refresh_all,
@@ -902,6 +1147,13 @@ class BeeKeypointAnnotator:
             command=self.toggle_track_id_mode,
         )
         self.track_mode_button.pack(side=tk.LEFT, padx=(0, 10))
+        self.direction_review_mode_button = ttk.Button(
+            track_controls,
+            text="进入方向复审批注",
+            style="Primary.TButton",
+            command=self.toggle_direction_review_mode,
+        )
+        self.direction_review_mode_button.pack(side=tk.LEFT, padx=(0, 10))
         self.next_track_id_button = ttk.Button(
             track_controls,
             text=self._action_button_text("下一个 ID ▶", "next_track_id"),
@@ -1509,6 +1761,9 @@ class BeeKeypointAnnotator:
             "open_shortcut_manager": self.open_shortcut_manager,
             "open_help": self.open_help,
             "toggle_label_names": self.toggle_label_names,
+            "toggle_track_ids": self.toggle_track_ids,
+            "toggle_bee_shadow_class": self.toggle_current_bee_shadow_class,
+            "toggle_box_class_labels": self.toggle_box_class_labels,
             "toggle_other_boxes": self.toggle_other_boxes,
             "previous_track_frame": self.previous_track_frame,
             "next_track_frame": self.next_track_frame,
@@ -1516,6 +1771,9 @@ class BeeKeypointAnnotator:
             "copy_frame_to_next": self.copy_current_frame_to_next,
             "propagate_track": self.propagate_current_track,
             "confirm_keypoints": self.confirm_current_keypoints,
+            "start_continuous_annotation": self.start_continuous_annotation_mode,
+            "clear_default_track_id": self.clear_default_track_id,
+            "toggle_continuous_other_boxes": self.toggle_continuous_other_boxes,
             "swap_head_tail": self.swap_current_head_tail,
             "next_review_issue": self.next_review_issue,
             "open_frame_table": self.open_frame_table,
@@ -1541,37 +1799,77 @@ class BeeKeypointAnnotator:
     def _refresh_shortcut_button_text(self) -> None:
         if hasattr(self, "previous_rectangle_button"):
             id_mode = bool(getattr(self, "track_id_mode", False))
+            direction_mode = bool(getattr(self, "direction_review_mode", False))
+            continuous_mode = bool(
+                getattr(self, "continuous_annotation_mode", False)
+            )
             self.previous_rectangle_button.configure(
                 text=self._action_button_text(
-                    "◀ 上一个 ID" if id_mode else "◀ 上一个框",
+                    "◀ 上一个复审对象"
+                    if direction_mode
+                    else ("◀ 上一个 ID" if id_mode else "◀ 上一个框"),
                     "previous_rectangle",
                 )
             )
             self.next_rectangle_button.configure(
                 text=self._action_button_text(
-                    "确认并下一帧 ▶" if id_mode else "下一个框 ▶",
+                    "确认并下一个 ▶"
+                    if direction_mode
+                    else (
+                        "确认并下一帧 ▶"
+                        if id_mode
+                        else (
+                            "复制对象到下一帧 ▶"
+                            if continuous_mode
+                            else "下一个框 ▶"
+                        )
+                    ),
                     "next_rectangle",
                 )
             )
             self.frame_table_button.configure(
                 text=self._action_button_text(
-                    "Track ID 清单" if id_mode else "本帧框清单",
+                    "方向复审清单"
+                    if direction_mode
+                    else ("Track ID 清单" if id_mode else "本帧框清单"),
                     "open_frame_table",
+                )
+            )
+        if hasattr(self, "toggle_class_button"):
+            self.toggle_class_button.configure(
+                text=self._action_button_text(
+                    "bee ↔ beeshadow", "toggle_bee_shadow_class"
                 )
             )
         if hasattr(self, "previous_track_button"):
             if hasattr(self, "next_track_id_button"):
                 self.next_track_id_button.configure(
-                    text=self._action_button_text("下一个 ID ▶", "next_track_id")
+                    text=self._action_button_text(
+                        "下一个复审对象 ▶"
+                        if getattr(self, "direction_review_mode", False)
+                        else "下一个 ID ▶",
+                        "next_track_id",
+                    )
                 )
             self.previous_track_button.configure(
-                text=self._action_button_text("◀ 同ID上一帧", "previous_track_frame")
+                text=self._action_button_text(
+                    "◀ 上一帧" if continuous_mode else "◀ 同ID上一帧",
+                    "previous_track_frame",
+                )
             )
             self.next_track_button.configure(
-                text=self._action_button_text("同ID下一帧 ▶", "next_track_frame")
+                text=self._action_button_text(
+                    "下一帧 ▶" if continuous_mode else "同ID下一帧 ▶",
+                    "next_track_frame",
+                )
             )
             self.copy_frame_button.configure(
-                text=self._action_button_text("整帧到下一张", "copy_frame_to_next")
+                text=self._action_button_text(
+                    "画 / 更新检测框"
+                    if getattr(self, "continuous_annotation_mode", False)
+                    else "整帧到下一张",
+                    "copy_frame_to_next",
+                )
             )
             self.propagate_track_button.configure(
                 text=self._action_button_text("ID传播", "propagate_track")
@@ -1585,29 +1883,424 @@ class BeeKeypointAnnotator:
             self.next_review_button.configure(
                 text=self._action_button_text("下一待审/异常", "next_review_issue")
             )
+            if hasattr(self, "continuous_mode_button"):
+                self.continuous_mode_button.configure(
+                    text=self._action_button_text(
+                        "下一个 ID｜回第一帧"
+                        if getattr(self, "continuous_annotation_mode", False)
+                        else "连续补标",
+                        "start_continuous_annotation",
+                    )
+                )
+            if hasattr(self, "clear_default_track_id_button"):
+                self.clear_default_track_id_button.configure(
+                    text=self._action_button_text(
+                        "清除默认 ID", "clear_default_track_id"
+                    )
+                )
 
     def _refresh_track_mode_ui(self) -> None:
         id_mode = bool(getattr(self, "track_id_mode", False))
+        direction_mode = bool(getattr(self, "direction_review_mode", False))
+        continuous_mode = bool(
+            getattr(self, "continuous_annotation_mode", False)
+        )
         if hasattr(self, "track_mode_button"):
             self.track_mode_button.configure(
                 text="退出按 ID 模式" if id_mode else "进入按 ID 标注模式",
                 style="Warning.TButton" if id_mode else "Primary.TButton",
+                state="disabled" if direction_mode or continuous_mode else "normal",
+            )
+        if hasattr(self, "direction_review_mode_button"):
+            has_items = (
+                bool(self._direction_review_items())
+                if getattr(self, "images", [])
+                and len(getattr(self, "documents", {}))
+                == len(getattr(self, "images", []))
+                else False
+            )
+            self.direction_review_mode_button.configure(
+                text="退出方向复审批注" if direction_mode else "进入方向复审批注",
+                style="Warning.TButton" if direction_mode else "Primary.TButton",
+                state=(
+                    "normal"
+                    if has_items and not continuous_mode
+                    else "disabled"
+                ),
+            )
+        if hasattr(self, "continuous_mode_button"):
+            self.continuous_mode_button.configure(
+                text=self._action_button_text(
+                    "下一个 ID｜回第一帧" if continuous_mode else "连续补标",
+                    "start_continuous_annotation",
+                ),
+                style="Warning.TButton" if continuous_mode else "Primary.TButton",
             )
         if hasattr(self, "image_combo"):
-            self.image_combo.configure(state="disabled" if id_mode else "readonly")
+            self.image_combo.configure(
+                state=(
+                    "disabled"
+                    if id_mode or direction_mode or continuous_mode
+                    else "readonly"
+                )
+            )
         if hasattr(self, "next_track_id_button"):
             self.next_track_id_button.configure(
-                state="normal" if id_mode else "disabled"
+                state="normal" if id_mode or direction_mode else "disabled"
             )
         for widget_name in (
-            "copy_frame_button",
             "propagate_track_button",
             "next_review_button",
         ):
             widget = getattr(self, widget_name, None)
             if widget is not None:
-                widget.configure(state="disabled" if id_mode else "normal")
+                widget.configure(
+                    state=(
+                        "disabled"
+                        if id_mode or direction_mode or continuous_mode
+                        else "normal"
+                    )
+                )
+        if hasattr(self, "copy_frame_button"):
+            self.copy_frame_button.configure(
+                state="disabled" if id_mode or direction_mode else "normal"
+            )
+        for widget_name in (
+            "default_track_id_combo",
+            "activate_default_track_id_button",
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.configure(
+                    state=(
+                        "disabled"
+                        if id_mode or direction_mode
+                        else "normal"
+                    )
+                )
+        if hasattr(self, "clear_default_track_id_button"):
+            self.clear_default_track_id_button.configure(
+                state=(
+                    "disabled"
+                    if id_mode or direction_mode or continuous_mode
+                    else "normal"
+                )
+            )
+        if hasattr(self, "direction_review_panel"):
+            if direction_mode:
+                self.overview_canvas.pack_forget()
+                self.direction_review_panel.pack_forget()
+                self.direction_review_panel.pack(side=tk.BOTTOM, fill=tk.X)
+                self.overview_canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+                self.overview_frame.configure(
+                    text="  02  模型预测 vs 当前标注｜方向复审  "
+                )
+                self.overview_canvas.configure(cursor="arrow")
+            else:
+                self.direction_review_panel.pack_forget()
+                self.overview_canvas.pack_forget()
+                self.overview_canvas.pack(fill=tk.BOTH, expand=True)
+                self.overview_frame.configure(text="  02  整图鸟瞰｜选择目标  ")
+                self.overview_canvas.configure(cursor="hand2")
+            self.root.after_idle(self._balance_main_pane)
         self._refresh_shortcut_button_text()
+
+    @staticmethod
+    def _normalize_track_id(value) -> Optional[int]:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, float):
+            return int(value) if value.is_integer() and value >= 0 else None
+        try:
+            parsed = int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed >= 0 else None
+
+    def _task_track_ids(self) -> List[int]:
+        track_ids = set()
+        for image_path in getattr(self, "images", []):
+            document = self.documents.get(image_path)
+            if document is None:
+                continue
+            for rectangle in rectangle_records(document):
+                track_id = self._normalize_track_id(rectangle.get("group_id"))
+                if track_id is not None:
+                    track_ids.add(track_id)
+        return sorted(track_ids)
+
+    @staticmethod
+    def _next_new_track_id(track_ids: List[int]) -> int:
+        return max(track_ids, default=0) + 1
+
+    def _refresh_default_track_id_controls(self) -> None:
+        track_ids = self._task_track_ids()
+        maximum = max(track_ids) if track_ids else None
+        if hasattr(self, "max_track_id_var"):
+            self.max_track_id_var.set(
+                f"任务最大 ID：{maximum}" if maximum is not None else "任务最大 ID：—"
+            )
+        combo = getattr(self, "default_track_id_combo", None)
+        if combo is not None:
+            suggestions = list(track_ids)
+            next_id = self._next_new_track_id(track_ids)
+            if next_id not in suggestions:
+                suggestions.append(next_id)
+            combo.configure(values=[str(track_id) for track_id in suggestions])
+        if hasattr(self, "default_track_id_status_var"):
+            active = getattr(self, "default_track_id", None)
+            if active is None:
+                status = "默认 ID：未启用"
+            elif getattr(self, "default_track_id_explicit", False):
+                status = f"手动 ID：{active}（在整图中拖动新增框）"
+            elif getattr(self, "continuous_annotation_mode", False):
+                status = f"连续补标新 ID：{active}"
+            else:
+                status = f"自动建议 ID：{active}"
+            self.default_track_id_status_var.set(status)
+        if (
+            hasattr(self, "overview_canvas")
+            and not getattr(self, "direction_review_mode", False)
+        ):
+            if getattr(self, "continuous_annotation_mode", False):
+                cursor = (
+                    "crosshair"
+                    if getattr(self, "continuous_draw_box_mode", False)
+                    else "hand2"
+                )
+            else:
+                cursor = (
+                    "crosshair"
+                    if getattr(self, "default_track_id", None) is not None
+                    else "hand2"
+                )
+            self.overview_canvas.configure(cursor=cursor)
+
+    def activate_default_track_id(self) -> None:
+        if getattr(self, "track_id_mode", False) or getattr(
+            self, "direction_review_mode", False
+        ):
+            self.status_var.set("请先退出 Track ID / 方向复审模式，再新增检测框")
+            return
+        track_id = self._normalize_track_id(self.default_track_id_text.get())
+        if track_id is None:
+            self.status_var.set("请输入大于或等于 0 的整数 Track ID")
+            return
+        self.default_track_id = track_id
+        self.default_track_id_explicit = True
+        self.rectangle_creation = None
+        if getattr(self, "continuous_annotation_mode", False):
+            self.continuous_active_track_id = track_id
+            self.continuous_draw_box_mode = False
+            self._refresh_default_track_id_controls()
+            self._set_image_index(0, auto_confirm_viewed=False)
+            self.status_var.set(
+                f"已切换到连续补标 ID {track_id}：已回到第 1 张；"
+                "右侧点选区域，R 画框，E 复制到下一帧"
+            )
+            return
+        self._refresh_default_track_id_controls()
+        self.status_var.set(
+            f"默认 Track ID 已设为 {track_id}；请在整图鸟瞰中拖动新增检测框"
+        )
+
+    def _activate_default_track_id_from_entry(self, event) -> str:
+        """回车应用默认 ID，并立即把输入焦点交还给图像画布。"""
+        track_id = self._normalize_track_id(self.default_track_id_text.get())
+        self.activate_default_track_id()
+        if track_id is not None and getattr(self, "default_track_id", None) == track_id:
+            try:
+                event.widget.selection_clear()
+            except tk.TclError:
+                pass
+            canvas = getattr(self, "overview_canvas", self.root)
+            self.root.after_idle(canvas.focus_set)
+        return "break"
+
+    def clear_default_track_id(
+        self, notify: bool = True, refresh: bool = True
+    ) -> None:
+        if getattr(self, "continuous_annotation_mode", False):
+            self.exit_continuous_annotation_mode(notify=False, refresh=False)
+        self.default_track_id = None
+        self.default_track_id_explicit = False
+        self.rectangle_creation = None
+        if hasattr(self, "default_track_id_text"):
+            self.default_track_id_text.set("")
+        self._refresh_default_track_id_controls()
+        if notify and hasattr(self, "status_var"):
+            self.status_var.set("已清除默认 Track ID；可输入下一个 ID")
+        if refresh and hasattr(self, "overview_canvas"):
+            self._draw_overview()
+
+    def toggle_continuous_annotation_mode(self) -> None:
+        if getattr(self, "continuous_annotation_mode", False):
+            self.exit_continuous_annotation_mode()
+        else:
+            self.start_continuous_annotation_mode()
+
+    def start_continuous_annotation_mode(self) -> None:
+        if not getattr(self, "images", []):
+            self.status_var.set("请先打开标注任务文件夹")
+            return
+
+        advancing = bool(getattr(self, "continuous_annotation_mode", False))
+        view_focus, view_zoom = self._current_view_state_for_continuous_mode()
+        if advancing:
+            current_id = self._normalize_track_id(self.continuous_active_track_id)
+            next_unused_id = self._next_new_track_id(self._task_track_ids())
+            track_id = max((current_id or 0) + 1, next_unused_id)
+            self.default_track_id_explicit = False
+        else:
+            if getattr(self, "default_track_id_explicit", False):
+                track_id = self._normalize_track_id(
+                    getattr(self, "default_track_id", None)
+                )
+            else:
+                track_id = self._next_new_track_id(self._task_track_ids())
+
+            if track_id is None:
+                self.status_var.set("请先输入有效的默认 Track ID")
+                return
+
+        self._close_track_completion_dialog()
+        self.track_id_mode = False
+        self.track_mode_current_id = None
+        self.direction_review_mode = False
+        self.direction_review_item_index = -1
+        self.continuous_annotation_mode = True
+        self.continuous_active_track_id = int(track_id)
+        self.continuous_draw_box_mode = False
+        self.rectangle_creation = None
+        self.continuous_focus_point = view_focus
+        self.continuous_zoom_factor = view_zoom
+        self.default_track_id = int(track_id)
+        self.default_track_id_text.set(str(track_id))
+        self._refresh_track_mode_ui()
+        self._set_image_index(
+            0,
+            preferred_group_id=int(track_id),
+            auto_confirm_viewed=False,
+        )
+        self.status_var.set(
+            f"{'已切换到' if advancing else '连续补标'} ID {track_id}："
+            "已从第 1 张开始；"
+            "右侧点选区域，R 画框，E 复制到下一帧"
+        )
+
+    def _current_view_state_for_continuous_mode(
+        self,
+    ) -> Tuple[Optional[Tuple[float, float]], float]:
+        """取得按 V 前左侧画面的中心和倍率，用于切帧后保持视野。"""
+        focus = getattr(self, "continuous_focus_point", None)
+        zoom = float(getattr(self, "continuous_zoom_factor", 3.0))
+        if focus is not None:
+            return focus, min(12.0, max(1.0, zoom))
+
+        transform = getattr(self, "detail_transform", None)
+        image = getattr(self, "current_pil_image", None)
+        canvas = getattr(self, "detail_canvas", None)
+        if transform is not None and image is not None and canvas is not None:
+            width = max(float(canvas.winfo_width()), 1.0)
+            height = max(float(canvas.winfo_height()), 1.0)
+            focus = self._clamp_point_to_current_image(
+                self._canvas_to_image(width / 2.0, height / 2.0, transform)
+            )
+            scale = max(float(transform[0]), 1e-6)
+            zoom = min(
+                float(image.width) * scale / width,
+                float(image.height) * scale / height,
+            )
+            return focus, min(12.0, max(1.0, zoom))
+
+        rectangles = (
+            self._current_rectangles()
+            if getattr(self, "current_image_index", -1) >= 0
+            else []
+        )
+        current_position = getattr(self, "current_rectangle_index", -1)
+        if 0 <= current_position < len(rectangles):
+            x1, y1, x2, y2 = rectangles[current_position]["rect"]
+            focus = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        elif image is not None:
+            focus = (float(image.width) / 2.0, float(image.height) / 2.0)
+        return focus, min(12.0, max(1.0, zoom))
+
+    def exit_continuous_annotation_mode(
+        self, notify: bool = True, refresh: bool = True
+    ) -> None:
+        self.continuous_annotation_mode = False
+        self.continuous_active_track_id = None
+        self.continuous_draw_box_mode = False
+        self.continuous_focus_point = None
+        self.rectangle_creation = None
+        self.detail_cache_key = None
+        self._refresh_track_mode_ui()
+        if refresh:
+            self._refresh_all()
+        if notify:
+            self.status_var.set("已退出连续补标模式")
+
+    def _continuous_rectangle_position(
+        self, document: Optional[Dict] = None
+    ) -> int:
+        document = document if document is not None else self._current_document()
+        if document is None:
+            return -1
+        track_id = self._normalize_track_id(
+            getattr(self, "continuous_active_track_id", None)
+        )
+        if track_id is None:
+            return -1
+        return next(
+            (
+                position
+                for position, rectangle in enumerate(rectangle_records(document))
+                if self._normalize_track_id(rectangle.get("group_id")) == track_id
+            ),
+            -1,
+        )
+
+    def _align_continuous_view_to_current_frame(self) -> None:
+        image = self.current_pil_image
+        position = self._continuous_rectangle_position()
+        rectangles = self._current_rectangles()
+        if 0 <= position < len(rectangles):
+            self.current_rectangle_index = position
+            self._remember_current_rectangle()
+            x1, y1, x2, y2 = rectangles[position]["rect"]
+            self.continuous_focus_point = ((x1 + x2) / 2, (y1 + y2) / 2)
+        else:
+            self.current_rectangle_index = -1
+            self.continuous_focus_point = (
+                (float(image.width) / 2, float(image.height) / 2)
+                if image is not None
+                else None
+            )
+        self.detail_cache_key = None
+        self._refresh_all()
+
+    def _on_continuous_zoom_wheel(self, event) -> str:
+        if not getattr(self, "continuous_annotation_mode", False):
+            return "break"
+        factor = 1.25 if event.delta > 0 else 0.8
+        self.continuous_zoom_factor = min(
+            12.0,
+            max(1.0, float(self.continuous_zoom_factor) * factor),
+        )
+        self.detail_cache_key = None
+        self._draw_detail()
+        self.status_var.set(f"左侧放大倍率：{self.continuous_zoom_factor:.1f}×")
+        return "break"
+
+    def _balance_main_pane(self) -> None:
+        if not hasattr(self, "main_pane"):
+            return
+        width = self.main_pane.winfo_width()
+        if width > 200:
+            self.main_pane.sashpos(0, int(width * 0.56))
 
     @staticmethod
     def _tk_toplevel_window_handle(widget) -> Optional[int]:
@@ -1713,6 +2406,7 @@ class BeeKeypointAnnotator:
 
     def load_folder(self, folder: Path) -> None:
         self._cancel_pointer_press()
+        self.clear_default_track_id(notify=False, refresh=False)
         folder = folder.resolve()
         images = sorted(
             path
@@ -1738,6 +2432,8 @@ class BeeKeypointAnnotator:
         self._close_track_completion_dialog()
         self.track_id_mode = False
         self.track_mode_current_id = None
+        self.direction_review_mode = False
+        self.direction_review_item_index = -1
         self._refresh_track_mode_ui()
 
         discovered_labels = []
@@ -1760,7 +2456,20 @@ class BeeKeypointAnnotator:
         self.image_combo.configure(values=[path.name for path in self.images])
         self.current_image_index = -1
         self.current_rectangle_index = -1
-        self._set_image_index(0)
+        direction_items = self._direction_review_items()
+        self.direction_review_mode = bool(direction_items)
+        self._refresh_track_mode_ui()
+        if direction_items:
+            self.direction_review_item_index = self._first_pending_direction_review_index()
+            target = direction_items[self.direction_review_item_index]
+            self._set_image_index(
+                target["image_index"],
+                preferred_group_id=target["group_id"],
+                preferred_rectangle_position=target["rectangle_position"],
+                auto_confirm_viewed=False,
+            )
+        else:
+            self._set_image_index(0)
         self.settings["default_folder"] = str(folder)
         repaired_text = (
             f"｜已修复 {repaired_reviews} 个旧版待确认状态"
@@ -1822,6 +2531,191 @@ class BeeKeypointAnnotator:
         document = self._current_document()
         return rectangle_records(document) if document else []
 
+    def _direction_review_items(self) -> List[Dict]:
+        items = []
+        for image_index, image_path in enumerate(getattr(self, "images", [])):
+            document = self._get_document(image_path)
+            for position, rectangle in enumerate(rectangle_records(document)):
+                if not rectangle_is_direction_review_item(document, position):
+                    continue
+                metadata = direction_review_metadata(rectangle)
+                items.append(
+                    {
+                        "image_index": image_index,
+                        "image_path": image_path,
+                        "rectangle_position": position,
+                        "group_id": rectangle.get("group_id"),
+                        "scene": metadata.get("scene", ""),
+                        "frame": metadata.get("frame", ""),
+                        "pending": rectangle_direction_review_is_pending(
+                            document, position
+                        ),
+                    }
+                )
+        return items
+
+    def _active_direction_review_item(self) -> Optional[Dict]:
+        items = self._direction_review_items()
+        index = getattr(self, "direction_review_item_index", -1)
+        return items[index] if 0 <= index < len(items) else None
+
+    def _go_to_direction_review_item(self, index: int) -> bool:
+        items = self._direction_review_items()
+        if not items:
+            self.status_var.set("当前任务没有方向复审对象")
+            return False
+        index = max(0, min(index, len(items) - 1))
+        self.direction_review_item_index = index
+        item = items[index]
+        self._set_image_index(
+            item["image_index"],
+            preferred_group_id=item["group_id"],
+            preferred_rectangle_position=item["rectangle_position"],
+            auto_confirm_viewed=False,
+        )
+        state = "待复审" if item["pending"] else "已复审"
+        self.status_var.set(
+            f"方向复审 {index + 1}/{len(items)}｜"
+            f"Track ID {item['group_id']}｜帧 {item['frame']}｜{state}"
+        )
+        return True
+
+    def _first_pending_direction_review_index(self) -> int:
+        return next(
+            (
+                index
+                for index, item in enumerate(self._direction_review_items())
+                if item["pending"]
+            ),
+            0,
+        )
+
+    def toggle_direction_review_mode(self) -> None:
+        if getattr(self, "continuous_annotation_mode", False):
+            self.status_var.set("请先退出连续补标模式")
+            return
+        if getattr(self, "direction_review_mode", False):
+            self.direction_review_mode = False
+            self.direction_review_item_index = -1
+            self._refresh_track_mode_ui()
+            self.status_var.set("已退出方向复审批注模式")
+            self._refresh_all()
+            return
+        if not self._direction_review_items():
+            self.status_var.set("当前任务没有方向复审批注数据")
+            return
+        self.track_id_mode = False
+        self.track_mode_current_id = None
+        self.clear_default_track_id(notify=False, refresh=False)
+        self.direction_review_mode = True
+        self._refresh_track_mode_ui()
+        self._go_to_direction_review_item(
+            self._first_pending_direction_review_index()
+        )
+
+    def previous_direction_review_item(self) -> None:
+        if not self.direction_review_mode:
+            return
+        if self.direction_review_item_index <= 0:
+            self.status_var.set("已经是第一个复审对象")
+            return
+        self._go_to_direction_review_item(self.direction_review_item_index - 1)
+
+    def next_direction_review_item(self) -> None:
+        if not self.direction_review_mode:
+            return
+        items = self._direction_review_items()
+        if self.direction_review_item_index + 1 >= len(items):
+            self.status_var.set("已经是最后一个复审对象")
+            return
+        self._go_to_direction_review_item(self.direction_review_item_index + 1)
+
+    def confirm_direction_review_and_next(self) -> None:
+        item = self._active_direction_review_item()
+        if item is None:
+            self.status_var.set("当前没有可确认的方向复审对象")
+            return
+        document = self._get_document(item["image_path"])
+        records = keypoints_for_rectangle(document, item["rectangle_position"])
+        if not all(
+            len([record for record in records if record["label"] == label]) == 1
+            for label in self._required_keypoint_labels()
+        ):
+            self.status_var.set("当前复审对象必须各有一个 head 和 tail")
+            return
+
+        if item["pending"]:
+            self._push_undo(item["image_path"])
+            confirm_direction_review_for_rectangle(
+                document, item["rectangle_position"]
+            )
+            self.dirty_images.add(item["image_path"])
+            self.save_all()
+
+        items = self._direction_review_items()
+        pending_target = next(
+            (
+                index
+                for index in range(self.direction_review_item_index + 1, len(items))
+                if items[index]["pending"]
+            ),
+            None,
+        )
+        if pending_target is None:
+            pending_target = next(
+                (
+                    index
+                    for index in range(0, self.direction_review_item_index)
+                    if items[index]["pending"]
+                ),
+                None,
+            )
+        if pending_target is None:
+            self._refresh_all()
+            self.status_var.set(f"方向复审已完成：{len(items)}/{len(items)}")
+            messagebox.showinfo(
+                "方向复审完成",
+                f"全部 {len(items)} 个头尾方向对象均已复审。",
+                parent=self.root,
+            )
+            return
+        self._go_to_direction_review_item(pending_target)
+
+    def _refresh_direction_review_queue(self) -> None:
+        if not getattr(self, "direction_review_mode", False):
+            return
+        items = self._direction_review_items()
+        reviewed = sum(not item["pending"] for item in items)
+        pending = len(items) - reviewed
+        current = self.direction_review_item_index + 1 if items else 0
+        self.direction_review_summary_var.set(
+            f"当前 {current}/{len(items)}｜已复审 {reviewed}｜剩余 {pending}"
+        )
+        tree = self.direction_review_tree
+        tree.delete(*tree.get_children())
+        for index, item in enumerate(items):
+            status = "待复审" if item["pending"] else "已复审"
+            scene = {"outdoor": "室外", "indoor": "室内"}.get(
+                item["scene"], item["scene"]
+            )
+            tree.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                values=(status, scene, item["frame"], item["group_id"]),
+                tags=("pending" if item["pending"] else "reviewed",),
+            )
+        if 0 <= self.direction_review_item_index < len(items):
+            iid = str(self.direction_review_item_index)
+            tree.selection_set(iid)
+            tree.focus(iid)
+            tree.see(iid)
+
+    def _on_direction_review_tree_double_click(self, event) -> None:
+        iid = self.direction_review_tree.identify_row(event.y)
+        if iid:
+            self._go_to_direction_review_item(int(iid))
+
     def _set_image_index(
         self,
         index: int,
@@ -1832,9 +2726,12 @@ class BeeKeypointAnnotator:
         if not self.images:
             return
         self._cancel_pointer_press()
+        self.rectangle_creation = None
+        if getattr(self, "continuous_annotation_mode", False):
+            self.continuous_draw_box_mode = False
         if self.rectangle_drag is not None:
             self._finish_rectangle_drag()
-        if auto_confirm_viewed:
+        if auto_confirm_viewed and not getattr(self, "direction_review_mode", False):
             self._auto_confirm_viewed_rectangle()
         index = max(0, min(index, len(self.images) - 1))
         old_image = self._current_image_path()
@@ -2033,7 +2930,40 @@ class BeeKeypointAnnotator:
 
     # ----------------------------- 框与点操作 -----------------------------
 
+    def toggle_current_bee_shadow_class(self) -> None:
+        document = self._current_document()
+        rectangles = self._current_rectangles()
+        position = self.current_rectangle_index
+        if document is None or not 0 <= position < len(rectangles):
+            self.status_var.set("当前没有可切换类别的检测框")
+            return
+
+        shape = rectangles[position]["shape"]
+        current_label = str(shape.get("label", "")).strip().lower()
+        if current_label == "bee":
+            target_label = "beeshadow"
+        elif current_label == "beeshadow":
+            target_label = "bee"
+        else:
+            self.status_var.set(
+                f"当前框类别为 {shape.get('label', '')}，只支持 bee / beeshadow 切换"
+            )
+            return
+
+        self._push_undo()
+        shape["label"] = target_label
+        self.overview_static_key = None
+        self._mark_dirty()
+        self._schedule_autosave()
+        self.status_var.set(
+            f"当前框类别已从 {current_label} 改为 {target_label}（正在自动保存）"
+        )
+        self._refresh_all()
+
     def previous_rectangle(self) -> None:
+        if getattr(self, "direction_review_mode", False):
+            self.previous_direction_review_item()
+            return
         if self.track_id_mode:
             self.previous_track_id()
             return
@@ -2044,6 +2974,12 @@ class BeeKeypointAnnotator:
         self._select_rectangle_position(target)
 
     def next_rectangle(self) -> None:
+        if getattr(self, "continuous_annotation_mode", False):
+            self.copy_continuous_object_to_next()
+            return
+        if getattr(self, "direction_review_mode", False):
+            self.confirm_direction_review_and_next()
+            return
         if self.track_id_mode:
             self.confirm_and_advance_track()
             return
@@ -2066,7 +3002,9 @@ class BeeKeypointAnnotator:
                 )
                 return
         if position != self.current_rectangle_index:
-            if not self.track_id_mode:
+            if not self.track_id_mode and not getattr(
+                self, "direction_review_mode", False
+            ):
                 self._auto_confirm_viewed_rectangle()
         self.current_rectangle_index = position
         self._remember_current_rectangle()
@@ -2146,7 +3084,12 @@ class BeeKeypointAnnotator:
         complete = self._frame_is_complete(document)
         previous = self.frame_completion_state.get(image_path)
         self.frame_completion_state[image_path] = complete
-        if notify and previous is False and complete:
+        if (
+            notify
+            and not getattr(self, "continuous_annotation_mode", False)
+            and previous is False
+            and complete
+        ):
             total = len(rectangle_records(document))
             image_name = image_path.name
             self.root.after_idle(
@@ -2326,6 +3269,9 @@ class BeeKeypointAnnotator:
         return True
 
     def toggle_track_id_mode(self) -> None:
+        if getattr(self, "continuous_annotation_mode", False):
+            self.status_var.set("请先退出连续补标模式")
+            return
         if self.track_id_mode:
             self._close_track_completion_dialog()
             self.track_id_mode = False
@@ -2351,6 +3297,7 @@ class BeeKeypointAnnotator:
                     (row["group_id"] for row in rows if row["remaining"] > 0),
                     rows[0]["group_id"],
                 )
+        self.clear_default_track_id(notify=False, refresh=False)
         self.track_id_mode = True
         self._refresh_track_mode_ui()
         self._go_to_track_id(target_id, first_unfinished=False)
@@ -2372,6 +3319,9 @@ class BeeKeypointAnnotator:
         self._go_to_track_id(track_ids[current_position - 1], first_unfinished=False)
 
     def next_track_id(self) -> None:
+        if getattr(self, "direction_review_mode", False):
+            self.next_direction_review_item()
+            return
         if not self.track_id_mode:
             self.status_var.set("请先进入按 ID 标注模式")
             return
@@ -2607,19 +3557,55 @@ class BeeKeypointAnnotator:
         self._set_image_index(
             target[0],
             preferred_group_id=group_id,
-            auto_confirm_viewed=not self.track_id_mode,
+            auto_confirm_viewed=not self.track_id_mode
+            and not getattr(self, "direction_review_mode", False),
         )
         self.status_var.set(
             f"Track ID {group_id}：第 {target[0] + 1}/{len(self.images)} 张"
         )
 
     def previous_track_frame(self) -> None:
+        if getattr(self, "continuous_annotation_mode", False):
+            self._move_continuous_frame(-1)
+            return
         self._move_within_current_track(-1)
 
     def next_track_frame(self) -> None:
+        if getattr(self, "continuous_annotation_mode", False):
+            self._move_continuous_frame(1)
+            return
         self._move_within_current_track(1)
 
+    def _move_continuous_frame(self, direction: int) -> None:
+        target_index = self.current_image_index + direction
+        if target_index < 0:
+            self.status_var.set("已经是第一帧")
+            return
+        if target_index >= len(self.images):
+            self.status_var.set("已经是最后一帧")
+            return
+        focus_point = self.continuous_focus_point
+        zoom_factor = self.continuous_zoom_factor
+        self._set_image_index(target_index, auto_confirm_viewed=False)
+        self.continuous_focus_point = focus_point
+        self.continuous_zoom_factor = zoom_factor
+        active_position = self._continuous_rectangle_position()
+        self.current_rectangle_index = active_position
+        if active_position >= 0:
+            self._remember_current_rectangle()
+        self.detail_cache_key = None
+        self._refresh_all()
+        has_active_box = active_position >= 0
+        self.status_var.set(
+            f"连续补标 ID {self.continuous_active_track_id}："
+            f"第 {target_index + 1}/{len(self.images)} 帧；"
+            f"当前帧{'已有该 ID' if has_active_box else '尚未标注该 ID'}"
+        )
+
     def copy_current_frame_to_next(self) -> None:
+        if getattr(self, "continuous_annotation_mode", False):
+            self.begin_continuous_rectangle_drawing()
+            return
         if self.track_id_mode:
             self.status_var.set("按 ID 模式请用 E：只复制当前 ID 并向后移动")
             return
@@ -2658,6 +3644,70 @@ class BeeKeypointAnnotator:
             f"保留 {plan['skipped_existing']} 个已有人工点"
         )
         self._refresh_all()
+
+    def begin_continuous_rectangle_drawing(self) -> None:
+        if not getattr(self, "continuous_annotation_mode", False):
+            return
+        if self.current_pil_image is None or self.detail_transform is None:
+            self.status_var.set("请先在右侧整图点击需要放大的区域")
+            return
+        self.continuous_draw_box_mode = True
+        self.rectangle_creation = None
+        if self.labels:
+            self.active_label.set(self.labels[0])
+        self.status_var.set("画框状态：请在左侧放大图中拖动检测框")
+        self._refresh_default_track_id_controls()
+        self._draw_detail()
+
+    def copy_continuous_object_to_next(self) -> None:
+        if not getattr(self, "continuous_annotation_mode", False):
+            return
+        if not self.images or self.current_image_index >= len(self.images) - 1:
+            self.status_var.set("已经是最后一帧，无法继续复制")
+            return
+
+        source_path = self._current_image_path()
+        source_document = self._current_document()
+        source_position = self._continuous_rectangle_position(source_document)
+        if source_path is None or source_document is None or source_position < 0:
+            self.status_var.set("当前帧还没有该 ID 的检测框，请先按 R 画框")
+            return
+
+        target_index = self.current_image_index + 1
+        target_path = self.images[target_index]
+        target_document = self._get_document(target_path)
+        target_position = self._continuous_rectangle_position(target_document)
+        copied = target_position < 0
+        if copied:
+            self._push_undo(target_path)
+            target_position = copy_rectangle_with_keypoints(
+                source_document,
+                source_position,
+                target_document,
+                suggested=True,
+            )
+            self.dirty_images.add(target_path)
+            self.save_all()
+
+        self.continuous_draw_box_mode = False
+        self.rectangle_creation = None
+        self._set_image_index(
+            target_index,
+            preferred_rectangle_position=target_position,
+            auto_confirm_viewed=False,
+        )
+        self._align_continuous_view_to_current_frame()
+        track_id = self.continuous_active_track_id
+        if copied:
+            self.status_var.set(
+                f"已将 ID {track_id} 的检测框和关键点复制到第 "
+                f"{target_index + 1} 张；复制内容为黄色待确认"
+            )
+        else:
+            self.status_var.set(
+                f"第 {target_index + 1} 张已存在 ID {track_id}，"
+                "未覆盖人工标注，已直接选中"
+            )
 
     def _records_form_confirmed_pair(self, records: List[Dict]) -> bool:
         required = self._required_keypoint_labels()
@@ -2891,6 +3941,10 @@ class BeeKeypointAnnotator:
         self.status_var.set(group_text + "：" + "；".join(target["reasons"]))
 
     def open_frame_table(self) -> None:
+        if getattr(self, "direction_review_mode", False):
+            self.direction_review_tree.focus_set()
+            self.status_var.set("方向复审清单已显示在模型对照图下方")
+            return
         if self.track_id_mode:
             self.open_track_id_table()
             return
@@ -3173,6 +4227,8 @@ class BeeKeypointAnnotator:
             self.selected_rectangle_by_image[image_path] = self.current_rectangle_index
 
     def _on_detail_wheel(self, event) -> str:
+        if getattr(self, "continuous_annotation_mode", False):
+            return self._on_continuous_zoom_wheel(event)
         if self.track_id_mode:
             self._move_within_current_track(-1 if event.delta > 0 else 1)
             return "break"
@@ -3199,8 +4255,63 @@ class BeeKeypointAnnotator:
                 pass
 
     def _on_pointer_press(self, event, view: str) -> str:
+        if getattr(self, "direction_review_mode", False) and view == "overview":
+            return "break"
+        if (
+            getattr(self, "continuous_annotation_mode", False)
+            and getattr(self, "continuous_draw_box_mode", False)
+            and view == "detail"
+            and self.detail_transform is not None
+            and self.current_pil_image is not None
+        ):
+            self._cancel_pointer_press()
+            point = self._clamp_point_to_current_image(
+                self._canvas_to_image(
+                    float(event.x), float(event.y), self.detail_transform
+                )
+            )
+            self.rectangle_creation = {
+                "view": "detail",
+                "transform": self.detail_transform,
+                "start": point,
+                "end": point,
+                "start_canvas": (float(event.x), float(event.y)),
+            }
+            self._draw_detail()
+            return "break"
         if self._control_pressed(event):
             return self._begin_rectangle_drag(event, view)
+        direct_target, direct_mode = self._rectangle_drag_candidate_at(
+            float(event.x), float(event.y), view
+        )
+        if direct_mode and direct_mode != "move":
+            self._cancel_pointer_press()
+            self._begin_rectangle_drag_at(
+                float(event.x), float(event.y), view, handle_only=False
+            )
+            return "break"
+        if (
+            view == "overview"
+            and not getattr(self, "continuous_annotation_mode", False)
+            and getattr(self, "default_track_id", None) is not None
+            and not direct_mode
+            and self.overview_transform is not None
+            and self.current_pil_image is not None
+        ):
+            self._cancel_pointer_press()
+            point = self._canvas_to_image(
+                float(event.x), float(event.y), self.overview_transform
+            )
+            point = self._clamp_point_to_current_image(point)
+            self.rectangle_creation = {
+                "view": "overview",
+                "transform": self.overview_transform,
+                "start": point,
+                "end": point,
+                "start_canvas": (float(event.x), float(event.y)),
+            }
+            self._draw_overview()
+            return "break"
         self._cancel_pointer_press()
         token = object()
         press = {
@@ -3211,6 +4322,8 @@ class BeeKeypointAnnotator:
             "latest_x": float(event.x),
             "latest_y": float(event.y),
             "image_path": self._current_image_path(),
+            "drag_target": direct_target,
+            "direct_move": direct_mode == "move",
             "job": None,
         }
         self.pointer_press = press
@@ -3241,6 +4354,18 @@ class BeeKeypointAnnotator:
             )
 
     def _on_pointer_motion(self, event, view: str):
+        creation = getattr(self, "rectangle_creation", None)
+        if creation is not None and creation.get("view") == view:
+            creation["end"] = self._clamp_point_to_current_image(
+                self._canvas_to_image(
+                    float(event.x), float(event.y), creation["transform"]
+                )
+            )
+            if view == "detail":
+                self._draw_detail()
+            else:
+                self._draw_overview()
+            return "break"
         if self.rectangle_drag is not None:
             return self._continue_rectangle_drag(event, view)
         press = self.pointer_press
@@ -3248,9 +4373,28 @@ class BeeKeypointAnnotator:
             return None
         press["latest_x"] = float(event.x)
         press["latest_y"] = float(event.y)
+        movement = math.hypot(
+            float(event.x) - press["start_x"],
+            float(event.y) - press["start_y"],
+        )
+        if movement > QUICK_CLICK_MAX_MOVEMENT_PX and press.get("direct_move"):
+            self._cancel_pointer_press()
+            started = self._begin_rectangle_drag_at(
+                press["start_x"],
+                press["start_y"],
+                view,
+                handle_only=False,
+            )
+            if started:
+                return self._continue_rectangle_drag_at(
+                    float(event.x), float(event.y), view
+                )
         return "break"
 
     def _on_pointer_release(self, event, view: str):
+        creation = getattr(self, "rectangle_creation", None)
+        if creation is not None and creation.get("view") == view:
+            return self._finish_rectangle_creation(event, view)
         if self.rectangle_drag is not None:
             return self._end_rectangle_drag(event, view)
         press = self.pointer_press
@@ -3262,14 +4406,116 @@ class BeeKeypointAnnotator:
         )
         self._cancel_pointer_press()
         if movement > QUICK_CLICK_MAX_MOVEMENT_PX:
-            self.status_var.set(
-                f"请先长按约 {self.long_press_delay_ms}ms，再拖动检测框"
-            )
+            self.status_var.set("拖动起点不在检测框内，未执行操作")
             return "break"
         if view == "detail":
             self._on_detail_click(event)
         else:
             self._on_overview_click(event)
+        return "break"
+
+    def _clamp_point_to_current_image(
+        self, point: Tuple[float, float]
+    ) -> Tuple[float, float]:
+        image = self.current_pil_image
+        if image is None:
+            return point
+        return (
+            min(float(image.width), max(0.0, float(point[0]))),
+            min(float(image.height), max(0.0, float(point[1]))),
+        )
+
+    def _current_frame_has_track_id(self, track_id: int) -> bool:
+        return any(
+            self._normalize_track_id(rectangle.get("group_id")) == track_id
+            for rectangle in self._current_rectangles()
+        )
+
+    def _finish_rectangle_creation(self, event, view: str = "overview") -> str:
+        creation = self.rectangle_creation
+        self.rectangle_creation = None
+        movement = math.hypot(
+            float(event.x) - creation["start_canvas"][0],
+            float(event.y) - creation["start_canvas"][1],
+        )
+        if movement <= QUICK_CLICK_MAX_MOVEMENT_PX:
+            if getattr(self, "continuous_annotation_mode", False):
+                self.status_var.set("请在左侧放大图中拖动，而不是单击")
+                self._draw_detail()
+            else:
+                self._on_overview_click(event)
+                self._draw_overview()
+            return "break"
+        transform = creation.get("transform")
+        if transform is None:
+            return "break"
+        end = self._clamp_point_to_current_image(
+            self._canvas_to_image(
+                float(event.x), float(event.y), transform
+            )
+        )
+        x1, x2 = sorted((creation["start"][0], end[0]))
+        y1, y2 = sorted((creation["start"][1], end[1]))
+        if x2 - x1 < 2.0 or y2 - y1 < 2.0:
+            self.status_var.set("检测框太小，请重新拖动")
+            if view == "detail":
+                self._draw_detail()
+            else:
+                self._draw_overview()
+            return "break"
+        continuous_mode = bool(
+            getattr(self, "continuous_annotation_mode", False)
+        )
+        track_id = (
+            getattr(self, "continuous_active_track_id", None)
+            if continuous_mode
+            else getattr(self, "default_track_id", None)
+        )
+        document = self._current_document()
+        if track_id is None or document is None:
+            self._refresh_all()
+            return "break"
+        if not continuous_mode and self._current_frame_has_track_id(track_id):
+            self.status_var.set(
+                f"当前图片已存在 Track ID {track_id}，未新增重复 ID"
+            )
+            self._draw_overview()
+            return "break"
+        rectangles = self._current_rectangles()
+        label = (
+            rectangles[self.current_rectangle_index].get("label")
+            if 0 <= self.current_rectangle_index < len(rectangles)
+            else "bee"
+        )
+        self._push_undo()
+        position = self._continuous_rectangle_position(document) if continuous_mode else -1
+        replacing = position >= 0
+        if replacing:
+            set_rectangle_bounds(document, position, (x1, y1, x2, y2))
+        else:
+            position = add_rectangle(
+                document,
+                (x1, y1, x2, y2),
+                track_id,
+                label=label or "bee",
+            )
+        self.current_rectangle_index = position
+        self._remember_current_rectangle()
+        if continuous_mode:
+            self.continuous_draw_box_mode = False
+            self.continuous_focus_point = ((x1 + x2) / 2, (y1 + y2) / 2)
+            if self.labels:
+                self.active_label.set(self.labels[0])
+        self.overview_static_key = None
+        self.detail_cache_key = None
+        self._mark_dirty()
+        self._schedule_autosave()
+        operation = "更新" if replacing else "新增"
+        self.status_var.set(
+            f"已{operation} Track ID {track_id} 的检测框；"
+            "已自动切回关键点标注"
+        )
+        self._refresh_all()
         return "break"
 
     def _rectangle_drag_target(
@@ -3280,8 +4526,8 @@ class BeeKeypointAnnotator:
         tolerance: float,
         handle_only: bool,
     ) -> Tuple[int, str]:
+        current = self.current_rectangle_index
         if handle_only:
-            current = self.current_rectangle_index
             if 0 <= current < len(rectangles):
                 mode = rectangle_handle_mode(
                     point,
@@ -3290,12 +4536,22 @@ class BeeKeypointAnnotator:
                 )
                 if mode:
                     return current, mode
-            if view == "detail":
-                if 0 <= current < len(rectangles) and point_in_rect(
-                    point, rectangles[current]["rect"]
-                ):
-                    return current, "move"
-                return -1, ""
+            handle_candidates = []
+            for position, rectangle in enumerate(rectangles):
+                if position == current:
+                    continue
+                candidate_mode = rectangle_handle_mode(
+                    point,
+                    rectangle["rect"],
+                    tolerance,
+                )
+                if candidate_mode:
+                    handle_candidates.append(
+                        (rect_area(rectangle["rect"]), position, candidate_mode)
+                    )
+            if handle_candidates:
+                _area, selected, mode = min(handle_candidates)
+                return selected, mode
             selected = smallest_containing_rectangle(
                 point,
                 (
@@ -3305,26 +4561,18 @@ class BeeKeypointAnnotator:
             )
             return (selected, "move") if selected >= 0 else (-1, "")
 
-        selected = -1
-        mode = ""
-        if view == "detail":
-            if 0 <= self.current_rectangle_index < len(rectangles):
-                selected = self.current_rectangle_index
-                mode = rectangle_drag_mode(
-                    point, rectangles[selected]["rect"], tolerance
-                )
-            return selected, mode
-
-        if 0 <= self.current_rectangle_index < len(rectangles):
+        if 0 <= current < len(rectangles):
             current_mode = rectangle_drag_mode(
                 point,
-                rectangles[self.current_rectangle_index]["rect"],
+                rectangles[current]["rect"],
                 tolerance,
             )
             if current_mode:
-                return self.current_rectangle_index, current_mode
+                return current, current_mode
         candidates = []
         for position, rectangle in enumerate(rectangles):
+            if position == current:
+                continue
             candidate_mode = rectangle_drag_mode(
                 point, rectangle["rect"], tolerance
             )
@@ -3334,9 +4582,35 @@ class BeeKeypointAnnotator:
                 )
         if candidates:
             _area, selected, mode = min(candidates)
-        return selected, mode
+            return selected, mode
+        return -1, ""
+
+    def _rectangle_drag_candidate_at(
+        self,
+        canvas_x: float,
+        canvas_y: float,
+        view: str,
+    ) -> Tuple[int, str]:
+        """只读判断鼠标是否命中可直接移动或缩放的检测框。"""
+        transform = (
+            self.detail_transform if view == "detail" else self.overview_transform
+        )
+        rectangles = self._current_rectangles()
+        if transform is None or not rectangles or not self.show_other_boxes.get():
+            return -1, ""
+        point = self._canvas_to_image(canvas_x, canvas_y, transform)
+        tolerance = 9.0 / max(transform[0], 1e-6)
+        return self._rectangle_drag_target(
+            point,
+            view,
+            rectangles,
+            tolerance,
+            handle_only=False,
+        )
 
     def _begin_rectangle_drag(self, event, view: str) -> str:
+        if getattr(self, "direction_review_mode", False) and view == "overview":
+            return "break"
         self._cancel_pointer_press()
         self._begin_rectangle_drag_at(event.x, event.y, view, handle_only=False)
         return "break"
@@ -3363,6 +4637,9 @@ class BeeKeypointAnnotator:
             or not rectangles
         ):
             return False
+        if not self.show_other_boxes.get():
+            self.status_var.set("检测框当前已隐藏；按 H 或勾选“显示全部框”后再调框")
+            return False
 
         point = self._canvas_to_image(canvas_x, canvas_y, transform)
         tolerance = 9.0 / max(transform[0], 1e-6)
@@ -3383,8 +4660,6 @@ class BeeKeypointAnnotator:
 
         if selected != self.current_rectangle_index:
             self._auto_confirm_viewed_rectangle()
-        self.current_rectangle_index = selected
-        self._remember_current_rectangle()
         self._push_undo()
         original_rect = tuple(rectangles[selected]["rect"])
         original_keypoints = self._snapshot_drag_keypoints(
@@ -3396,6 +4671,7 @@ class BeeKeypointAnnotator:
             "view": view,
             "image_path": image_path,
             "rectangle_position": selected,
+            "activate_on_finish": selected != self.current_rectangle_index,
             "original_rect": original_rect,
             "original_keypoints": original_keypoints,
             "start": point,
@@ -3500,6 +4776,9 @@ class BeeKeypointAnnotator:
         if drag is None:
             return
         self.rectangle_drag = None
+        if drag.get("activate_on_finish"):
+            self.current_rectangle_index = drag["rectangle_position"]
+            self._remember_current_rectangle()
         image_path = drag["image_path"]
         if drag["changed"]:
             self.dirty_images.add(image_path)
@@ -3535,13 +4814,32 @@ class BeeKeypointAnnotator:
             return
         document = self._current_document()
         rectangles = self._current_rectangles()
-        if document is None or not 0 <= self.current_rectangle_index < len(rectangles):
+        if document is None or not rectangles:
             return
         point = self._canvas_to_image(event.x, event.y, self.detail_transform)
-        selected_rect = rectangles[self.current_rectangle_index]["rect"]
+        selected = self.current_rectangle_index
+        if self.show_other_boxes.get():
+            clicked = smallest_containing_rectangle(
+                point,
+                (
+                    (position, rectangle["rect"])
+                    for position, rectangle in enumerate(rectangles)
+                ),
+            )
+            if clicked >= 0:
+                selected = clicked
+        if not 0 <= selected < len(rectangles):
+            self.status_var.set("请在检测框内部点击")
+            return
+        selected_rect = rectangles[selected]["rect"]
         if not point_in_rect(point, selected_rect):
             self.status_var.set("请在黄色检测框内部点击")
             return
+
+        if selected != self.current_rectangle_index:
+            self._auto_confirm_viewed_rectangle()
+            self.current_rectangle_index = selected
+            self._remember_current_rectangle()
 
         label = self.active_label.get().strip()
         if not label:
@@ -3550,7 +4848,7 @@ class BeeKeypointAnnotator:
 
         self._push_undo()
         add_or_replace_point(
-            document, self.current_rectangle_index, label, point, replace_same_label=True
+            document, selected, label, point, replace_same_label=True
         )
         message = f"已标注 {label}"
         if (
@@ -3568,7 +4866,7 @@ class BeeKeypointAnnotator:
             )
             add_or_replace_point(
                 document,
-                self.current_rectangle_index,
+                selected,
                 target_label,
                 target_point,
                 replace_same_label=True,
@@ -3581,6 +4879,69 @@ class BeeKeypointAnnotator:
         self._schedule_autosave()
         self.status_var.set(message + "（正在自动保存）")
         self._refresh_all()
+
+    def _on_detail_middle_press(self, event) -> str:
+        if self.detail_transform is None or self.current_pil_image is None:
+            return "break"
+        image_path = self._current_image_path()
+        if image_path is None:
+            return "break"
+        canvas_width = max(float(self.detail_canvas.winfo_width()), 1.0)
+        canvas_height = max(float(self.detail_canvas.winfo_height()), 1.0)
+        focus = self._canvas_to_image(
+            canvas_width / 2.0,
+            canvas_height / 2.0,
+            self.detail_transform,
+        )
+        self.middle_pan = {
+            "image_path": image_path,
+            "rectangle_position": self.current_rectangle_index,
+            "start": (float(event.x), float(event.y)),
+            "focus": focus,
+            "scale": max(float(self.detail_transform[0]), 1e-6),
+            "moved": False,
+        }
+        self.detail_canvas.configure(cursor="fleur")
+        return "break"
+
+    def _on_detail_middle_motion(self, event) -> str:
+        pan = getattr(self, "middle_pan", None)
+        if pan is None or pan["image_path"] != self._current_image_path():
+            return "break"
+        dx = float(event.x) - pan["start"][0]
+        dy = float(event.y) - pan["start"][1]
+        if math.hypot(dx, dy) <= QUICK_CLICK_MAX_MOVEMENT_PX:
+            return "break"
+        pan["moved"] = True
+        focus = self._clamp_point_to_current_image(
+            (
+                pan["focus"][0] - dx / pan["scale"],
+                pan["focus"][1] - dy / pan["scale"],
+            )
+        )
+        if getattr(self, "continuous_annotation_mode", False):
+            self.continuous_focus_point = focus
+        else:
+            key = (pan["image_path"], pan["rectangle_position"])
+            self.detail_view_centers[key] = focus
+        self.detail_cache_key = None
+        self._draw_detail()
+        self.status_var.set("正在移动左侧画面")
+        return "break"
+
+    def _on_detail_middle_release(self, event) -> str:
+        pan = getattr(self, "middle_pan", None)
+        if pan is None:
+            return "break"
+        self._on_detail_middle_motion(event)
+        moved = bool(pan.get("moved"))
+        self.middle_pan = None
+        self.detail_canvas.configure(cursor="crosshair")
+        if moved:
+            self.status_var.set("左侧画面位置已调整")
+        else:
+            self._on_detail_middle_click(event)
+        return "break"
 
     def _on_detail_middle_click(self, event) -> None:
         if self.detail_transform is None:
@@ -3607,54 +4968,339 @@ class BeeKeypointAnnotator:
         self.status_var.set(f"已删除附近的 {deleted_label} 点（正在自动保存）")
         self._refresh_all()
 
-    def _on_detail_right_click(self, event) -> None:
+    def _on_detail_right_click(self, event) -> str:
         if self.detail_transform is None:
-            return
+            return "break"
         document = self._current_document()
         rectangles = self._current_rectangles()
-        if (
-            document is None
-            or not 0 <= self.current_rectangle_index < len(rectangles)
-        ):
-            return
+        if document is None or not rectangles:
+            return "break"
         point = self._canvas_to_image(event.x, event.y, self.detail_transform)
 
-        if self.symmetry_enabled.get():
-            selected_rect = rectangles[self.current_rectangle_index]["rect"]
-            if not point_in_rect(point, selected_rect):
-                self.status_var.set("请在黄色检测框内部点击")
-                return
-            target_label = self.symmetry_target_label.get().strip()
-            if not target_label:
-                self.status_var.set("请先选择对称目标标签")
-                return
-            self._push_undo()
-            add_or_replace_point(
-                document,
-                self.current_rectangle_index,
-                target_label,
-                point,
-                replace_same_label=True,
-            )
-            self._mark_dirty()
-            self._schedule_autosave()
-            self.status_var.set(
-                f"已用右键手动标注 {target_label}（正在自动保存）"
-            )
-            self._refresh_all()
+        if not self._control_pressed(event):
+            selected = self.current_rectangle_index
+            if self.show_other_boxes.get():
+                selected = smallest_containing_rectangle(
+                    point,
+                    (
+                        (position, rectangle["rect"])
+                        for position, rectangle in enumerate(rectangles)
+                    ),
+                )
+            if selected >= 0:
+                self._apply_detail_right_click_point_action(point, selected)
+            else:
+                self.status_var.set("请在检测框内部右键标注 tail")
+            return "break"
+
+        if not self.show_other_boxes.get():
+            self.status_var.set("检测框当前已隐藏；按 H 显示后再用 Ctrl+右键改 ID")
+            return "break"
+        selected = -1
+        selected = smallest_containing_rectangle(
+            point,
+            (
+                (position, rectangle["rect"])
+                for position, rectangle in enumerate(rectangles)
+            ),
+        )
+
+        if selected < 0:
+            self.status_var.set("Ctrl+右键没有点中检测框")
+            return "break"
+
+        self._show_detail_rectangle_context_menu(event, point, selected)
+        return "break"
+
+    def _show_detail_rectangle_context_menu(
+        self,
+        event,
+        point: Tuple[float, float],
+        rectangle_position: int,
+    ) -> None:
+        if rectangle_position != self.current_rectangle_index:
+            self._auto_confirm_viewed_rectangle()
+        self.current_rectangle_index = rectangle_position
+        self._remember_current_rectangle()
+        self._refresh_all()
+
+        menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(
+            label="修改 Track ID…",
+            command=lambda: self._change_detail_rectangle_id(rectangle_position),
+        )
+        menu.add_separator()
+        menu.add_command(
+            label="删除该框及关联关键点…",
+            command=lambda: self._delete_rectangle_with_keypoints(
+                rectangle_position
+            ),
+        )
+        menu.add_command(
+            label="删除当前帧及之后所有相同 ID 的框…",
+            command=lambda: self._delete_current_and_following_track_boxes(
+                rectangle_position
+            ),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _delete_rectangle_with_keypoints(self, rectangle_position: int) -> None:
+        document = self._current_document()
+        rectangles = self._current_rectangles()
+        if document is None or not 0 <= rectangle_position < len(rectangles):
             return
 
-        self._push_undo()
-        deleted_label = delete_nearest_point(
-            document, self.current_rectangle_index, point
-        )
-        if deleted_label is None:
-            self._discard_last_undo()
-            self.status_var.set("当前框没有可删除的关键点")
+        rectangle = rectangles[rectangle_position]
+        point_count = len(keypoints_for_rectangle(document, rectangle_position))
+        track_id = rectangle.get("group_id")
+        track_text = "无 ID" if track_id is None else f"ID {track_id}"
+        if not messagebox.askyesno(
+            "确认删除检测框",
+            f"确定删除该检测框（{track_text}）及其关联的 {point_count} 个关键点吗？\n\n可按 Ctrl+Z 撤销。",
+        ):
             return
+
+        self.current_rectangle_index = rectangle_position
+        self._remember_current_rectangle()
+        self._push_undo()
+        deleted_count = delete_rectangle_with_keypoints(
+            document, rectangle_position
+        )
+        if deleted_count == 0:
+            self._discard_last_undo()
+            self.status_var.set("检测框已不存在")
+            return
+
+        remaining = self._current_rectangles()
+        self.current_rectangle_index = (
+            min(rectangle_position, len(remaining) - 1) if remaining else -1
+        )
+        self._remember_current_rectangle()
+        self.overview_static_key = None
         self._mark_dirty()
         self._schedule_autosave()
-        self.status_var.set(f"已删除最近的 {deleted_label} 点（正在自动保存）")
+        self.status_var.set(
+            f"已删除检测框及 {point_count} 个关联关键点（正在自动保存）"
+        )
+        self._refresh_all()
+
+    def _delete_current_and_following_track_boxes(
+        self, rectangle_position: int
+    ) -> None:
+        document = self._current_document()
+        rectangles = self._current_rectangles()
+        if document is None or not 0 <= rectangle_position < len(rectangles):
+            return
+        track_id = self._normalize_track_id(
+            rectangles[rectangle_position].get("group_id")
+        )
+        if track_id is None:
+            self.status_var.set("该检测框没有有效 ID，不能批量删除")
+            return
+
+        targets = self._track_id_change_targets(
+            track_id, rectangle_position, "after"
+        )
+        if not targets:
+            self.status_var.set("没有找到需要删除的同 ID 检测框")
+            return
+        point_count = sum(
+            len(keypoints_for_rectangle(self._get_document(image_path), position))
+            for _image_index, image_path, position in targets
+        )
+        frame_count = len({image_path for _index, image_path, _position in targets})
+        if not messagebox.askyesno(
+            "确认批量删除检测框",
+            f"确定删除当前帧及之后的所有 ID {track_id} 检测框吗？\n\n"
+            f"共 {frame_count} 帧、{len(targets)} 个框、{point_count} 个关键点。",
+            icon="warning",
+            parent=self.root,
+        ):
+            return
+
+        targets_by_image: Dict[Path, List[int]] = {}
+        for _image_index, image_path, position in targets:
+            targets_by_image.setdefault(image_path, []).append(position)
+        for image_path, positions in targets_by_image.items():
+            self._push_undo(image_path)
+            target_document = self._get_document(image_path)
+            for position in sorted(positions, reverse=True):
+                delete_rectangle_with_keypoints(target_document, position)
+            self.dirty_images.add(image_path)
+
+        remaining = self._current_rectangles()
+        self.current_rectangle_index = (
+            min(rectangle_position, len(remaining) - 1) if remaining else -1
+        )
+        self._remember_current_rectangle()
+        self.overview_static_key = None
+        self.detail_cache_key = None
+        self._schedule_autosave()
+        self.status_var.set(
+            f"已删除 ID {track_id} 在当前及之后的 {len(targets)} 个框"
+            f"和 {point_count} 个关键点（正在自动保存）"
+        )
+        self._refresh_all()
+
+    def _apply_detail_right_click_point_action(
+        self,
+        point: Tuple[float, float],
+        rectangle_position: int,
+    ) -> None:
+        document = self._current_document()
+        rectangles = self._current_rectangles()
+        if document is None or not 0 <= rectangle_position < len(rectangles):
+            return
+        if rectangle_position != self.current_rectangle_index:
+            self._auto_confirm_viewed_rectangle()
+        self.current_rectangle_index = rectangle_position
+        self._remember_current_rectangle()
+        selected_rect = rectangles[rectangle_position]["rect"]
+        if not point_in_rect(point, selected_rect):
+            self.status_var.set("请在检测框内部右键标注 tail")
+            return
+        target_label = self.symmetry_target_label.get().strip() or "tail"
+        self._push_undo()
+        add_or_replace_point(
+            document,
+            rectangle_position,
+            target_label,
+            point,
+            replace_same_label=True,
+        )
+        self._mark_dirty()
+        self._schedule_autosave()
+        self.status_var.set(
+            f"已用右键标注 {target_label}（正在自动保存）"
+        )
+        self._refresh_all()
+
+    def _track_id_change_targets(
+        self,
+        old_track_id: int,
+        rectangle_position: int,
+        scope: str,
+    ) -> List[Tuple[int, Path, int]]:
+        """返回批量改 ID 的（帧序号、图片路径、框序号）列表。"""
+        if scope == "current":
+            image_path = self._current_image_path()
+            return (
+                [(self.current_image_index, image_path, rectangle_position)]
+                if image_path is not None
+                else []
+            )
+
+        if scope == "before":
+            frame_indices = range(0, self.current_image_index + 1)
+        elif scope == "after":
+            frame_indices = range(self.current_image_index, len(self.images))
+        else:
+            raise ValueError(f"未知修改范围：{scope}")
+
+        targets = []
+        for image_index in frame_indices:
+            image_path = self.images[image_index]
+            document = self._get_document(image_path)
+            for position, rectangle in enumerate(rectangle_records(document)):
+                if self._normalize_track_id(rectangle.get("group_id")) == old_track_id:
+                    targets.append((image_index, image_path, position))
+        return targets
+
+    def _change_detail_rectangle_id(self, rectangle_position: int) -> None:
+        document = self._current_document()
+        rectangles = self._current_rectangles()
+        if document is None or not 0 <= rectangle_position < len(rectangles):
+            return
+        selected = rectangles[rectangle_position]
+        old_track_id = selected.get("group_id")
+        initial_id = self._normalize_track_id(old_track_id)
+        if initial_id is None or initial_id <= 0:
+            initial_id = self._next_new_track_id(self._task_track_ids())
+        dialog = TrackIdChangeDialog(
+            "手动修改 Track ID",
+            f"当前帧 ID 为 {old_track_id}，请输入修改后的 ID（按 G 确认）：",
+            initialvalue=initial_id,
+            minvalue=1,
+            parent=self.root,
+        )
+        new_track_id = dialog.result
+        if new_track_id is None:
+            self.status_var.set("已取消修改 ID")
+            return
+        scope = getattr(dialog, "selected_scope", "current")
+        if self._normalize_track_id(old_track_id) == new_track_id:
+            self.status_var.set("输入的 ID 没有变化")
+            return
+
+        normalized_old_id = self._normalize_track_id(old_track_id)
+        if normalized_old_id is None:
+            scope = "current"
+        targets = self._track_id_change_targets(
+            normalized_old_id,
+            rectangle_position,
+            scope,
+        )
+        target_positions = {
+            (image_path, position) for _index, image_path, position in targets
+        }
+        duplicate_frames = set()
+        for image_index, image_path, _position in targets:
+            target_document = self._get_document(image_path)
+            if any(
+                (image_path, position) not in target_positions
+                and self._normalize_track_id(rectangle.get("group_id")) == new_track_id
+                for position, rectangle in enumerate(rectangle_records(target_document))
+            ):
+                duplicate_frames.add(image_index)
+        if duplicate_frames:
+            confirmed = messagebox.askyesno(
+                "确认同帧重复 ID",
+                f"修改范围内有 {len(duplicate_frames)} 帧已经存在 ID {new_track_id}。\n\n"
+                f"继续后，这些帧会同时存在多个 ID {new_track_id} 检测框。"
+                "是否仍要修改？",
+                icon="warning",
+                parent=self.root,
+            )
+            if not confirmed:
+                self.status_var.set("已取消修改 ID")
+                return
+
+        if not targets:
+            self.status_var.set("输入的 ID 没有变化")
+            return
+
+        self.current_rectangle_index = rectangle_position
+        self._remember_current_rectangle()
+        affected_images = []
+        shape_changes = 0
+        for _image_index, image_path, position in targets:
+            if image_path not in affected_images:
+                affected_images.append(image_path)
+                self._push_undo(image_path)
+            target_document = self._get_document(image_path)
+            shape_changes += change_rectangle_group_id(
+                target_document,
+                position,
+                int(new_track_id),
+            )
+            self.dirty_images.add(image_path)
+            self.overview_dirty_positions.setdefault(image_path, set()).add(position)
+
+        self._schedule_autosave()
+        self._refresh_default_track_id_controls()
+        scope_text = {
+            "current": "当前帧",
+            "before": "当前帧及此前",
+            "after": "当前帧及此后",
+        }[scope]
+        self.status_var.set(
+            f"已在{scope_text}将 {len(targets)} 个 ID {old_track_id} 框改为 "
+            f"{new_track_id}；同步修改 {max(0, shape_changes - len(targets))} 个 "
+            "head/tail（正在自动保存）"
+        )
         self._refresh_all()
 
     def _on_overview_click(self, event):
@@ -3662,12 +5308,31 @@ class BeeKeypointAnnotator:
             return "break"
         if self.overview_transform is None:
             return
-        point = self._canvas_to_image(event.x, event.y, self.overview_transform)
+        point = self._clamp_point_to_current_image(
+            self._canvas_to_image(event.x, event.y, self.overview_transform)
+        )
         rectangles = self._current_rectangles()
         selected = smallest_containing_rectangle(
             point,
             ((position, rectangle["rect"]) for position, rectangle in enumerate(rectangles)),
         )
+        if getattr(self, "continuous_annotation_mode", False):
+            self.continuous_focus_point = point
+            active_position = self._continuous_rectangle_position()
+            if selected >= 0 and selected == active_position:
+                self.current_rectangle_index = selected
+                self._remember_current_rectangle()
+            elif active_position >= 0:
+                self.current_rectangle_index = active_position
+                self._remember_current_rectangle()
+            else:
+                self.current_rectangle_index = -1
+            self.detail_cache_key = None
+            self.status_var.set(
+                "左侧已放大右侧点击区域；按 R 可画框，滚轮可缩放"
+            )
+            self._refresh_all()
+            return "break"
         if selected >= 0:
             self._select_rectangle_position(selected)
         else:
@@ -3718,17 +5383,22 @@ class BeeKeypointAnnotator:
 
     def _refresh_all(self) -> None:
         self.redraw_job = None
+        self._refresh_default_track_id_controls()
         self.refresh_track_stats = (
             self._track_completion_stats(self.track_mode_current_id)
             if self.track_id_mode and self.track_mode_current_id is not None
             else None
         )
+        self._refresh_direction_review_queue()
         self._draw_detail()
         self._draw_overview()
         self._update_information()
         self._update_frame_completion_state(notify=True)
 
     def _draw_overview(self) -> None:
+        if getattr(self, "direction_review_mode", False):
+            self._draw_direction_review_comparison()
+            return
         canvas = self.overview_canvas
         image = self.current_pil_image
         if image is None:
@@ -3781,13 +5451,14 @@ class BeeKeypointAnnotator:
         points_by_rectangle = (
             keypoints_by_rectangle(document, rectangles) if document else {}
         )
-        show_other = self.show_other_boxes.get()
+        show_boxes = self.show_other_boxes.get()
         static_key = (
             cache_key,
             len(rectangles),
-            show_other,
+            show_boxes,
             self.show_label_names.get(),
-            None if show_other else self.current_rectangle_index,
+            self.show_track_ids.get(),
+            self.show_box_class_labels.get(),
         )
         image_path = self._current_image_path()
         full_redraw = static_key != self.overview_static_key
@@ -3801,12 +5472,12 @@ class BeeKeypointAnnotator:
                 tags=("overview_static",),
             )
             for position, rectangle in enumerate(rectangles):
-                if show_other or position == self.current_rectangle_index:
-                    self._draw_overview_position(
-                        position,
-                        rectangle,
-                        points_by_rectangle.get(position, []),
-                    )
+                self._draw_overview_position(
+                    position,
+                    rectangle,
+                    points_by_rectangle.get(position, []),
+                    show_box=show_boxes,
+                )
             self.overview_static_key = static_key
             if image_path is not None:
                 self.overview_dirty_positions.pop(image_path, None)
@@ -3814,18 +5485,21 @@ class BeeKeypointAnnotator:
             dirty_positions = self.overview_dirty_positions.pop(image_path, set())
             for position in dirty_positions:
                 canvas.delete(f"overview_position_{position}")
-                if 0 <= position < len(rectangles) and (
-                    show_other or position == self.current_rectangle_index
-                ):
+                if 0 <= position < len(rectangles):
                     self._draw_overview_position(
                         position,
                         rectangles[position],
                         points_by_rectangle.get(position, []),
+                        show_box=show_boxes,
                     )
 
         canvas.delete("overview_dynamic")
         selected_outline = "#FFD54F"
-        if rectangles and 0 <= self.current_rectangle_index < len(rectangles):
+        if (
+            show_boxes
+            and rectangles
+            and 0 <= self.current_rectangle_index < len(rectangles)
+        ):
             selected_rectangle = rectangles[self.current_rectangle_index]
             state = self._keypoint_state(
                 points_by_rectangle.get(self.current_rectangle_index, []),
@@ -3854,6 +5528,25 @@ class BeeKeypointAnnotator:
                 self.overview_transform,
                 selected_outline,
                 size=4,
+                tags=("overview_dynamic",),
+            )
+
+        creation = getattr(self, "rectangle_creation", None)
+        if creation is not None and creation.get("view") == "overview":
+            cx1, cy1 = self._image_to_canvas(
+                creation["start"], self.overview_transform
+            )
+            cx2, cy2 = self._image_to_canvas(
+                creation["end"], self.overview_transform
+            )
+            canvas.create_rectangle(
+                cx1,
+                cy1,
+                cx2,
+                cy2,
+                outline="#00E5FF",
+                width=3,
+                dash=(7, 4),
                 tags=("overview_dynamic",),
             )
 
@@ -3941,11 +5634,226 @@ class BeeKeypointAnnotator:
                 tags=("overview_dynamic",),
             )
 
+    def _draw_direction_review_comparison(self) -> None:
+        canvas = self.overview_canvas
+        canvas.delete("all")
+        image = self.current_pil_image
+        document = self._current_document()
+        rectangles = self._current_rectangles()
+        if (
+            image is None
+            or document is None
+            or not 0 <= self.current_rectangle_index < len(rectangles)
+        ):
+            canvas.create_text(
+                max(canvas.winfo_width(), 200) / 2,
+                max(canvas.winfo_height(), 200) / 2,
+                text="当前帧没有可用于方向对照的个体",
+                fill="white",
+                font=("Microsoft YaHei UI", 13, "bold"),
+            )
+            self.overview_transform = None
+            return
+
+        rectangle = rectangles[self.current_rectangle_index]
+        metadata = direction_review_metadata(rectangle)
+        model_head = metadata.get("model_head")
+        model_tail = metadata.get("model_tail")
+        records = keypoints_for_rectangle(document, self.current_rectangle_index)
+        manual_head = next(
+            (record["point"] for record in records if record["label"] == "head"),
+            None,
+        )
+        manual_tail = next(
+            (record["point"] for record in records if record["label"] == "tail"),
+            None,
+        )
+
+        x1, y1, x2, y2 = rectangle["rect"]
+        all_points = [
+            point
+            for point in (model_head, model_tail, manual_head, manual_tail)
+            if point is not None
+        ]
+        if all_points:
+            x1 = min(x1, *(point[0] for point in all_points))
+            y1 = min(y1, *(point[1] for point in all_points))
+            x2 = max(x2, *(point[0] for point in all_points))
+            y2 = max(y2, *(point[1] for point in all_points))
+        box_width = max(1.0, x2 - x1)
+        box_height = max(1.0, y2 - y1)
+        padding_x = max(box_width * 1.15, 28.0)
+        padding_y = max(box_height * 1.15, 28.0)
+        crop_x1 = max(0.0, x1 - padding_x)
+        crop_y1 = max(0.0, y1 - padding_y)
+        crop_x2 = min(float(image.width), x2 + padding_x)
+        crop_y2 = min(float(image.height), y2 + padding_y)
+
+        canvas_width = max(canvas.winfo_width(), 160)
+        canvas_height = max(canvas.winfo_height(), 160)
+        crop_width = max(1.0, crop_x2 - crop_x1)
+        crop_height = max(1.0, crop_y2 - crop_y1)
+        scale = min(canvas_width / crop_width, canvas_height / crop_height) * 0.92
+        display_width = max(1, int(crop_width * scale))
+        display_height = max(1, int(crop_height * scale))
+        offset_x = (canvas_width - display_width) / 2
+        offset_y = (canvas_height - display_height) / 2
+        crop = image.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+        resized = crop.resize((display_width, display_height), Image.Resampling.LANCZOS)
+        self.direction_review_photo = ImageTk.PhotoImage(resized)
+        canvas.create_image(
+            offset_x,
+            offset_y,
+            image=self.direction_review_photo,
+            anchor=tk.NW,
+        )
+        self.overview_transform = (
+            scale,
+            offset_x - crop_x1 * scale,
+            offset_y - crop_y1 * scale,
+        )
+
+        rect_x1, rect_y1 = self._image_to_canvas(
+            (rectangle["rect"][0], rectangle["rect"][1]), self.overview_transform
+        )
+        rect_x2, rect_y2 = self._image_to_canvas(
+            (rectangle["rect"][2], rectangle["rect"][3]), self.overview_transform
+        )
+        canvas.create_rectangle(
+            rect_x1,
+            rect_y1,
+            rect_x2,
+            rect_y2,
+            outline="#D9E3F0",
+            width=2,
+        )
+
+        def draw_direction(head, tail, line_color, head_color, tail_color, prefix, dash=None):
+            if head is None or tail is None:
+                return
+            hx, hy = self._image_to_canvas(head, self.overview_transform)
+            tx, ty = self._image_to_canvas(tail, self.overview_transform)
+            canvas.create_line(
+                hx,
+                hy,
+                tx,
+                ty,
+                fill=line_color,
+                width=4,
+                arrow=tk.LAST,
+                arrowshape=(13, 16, 6),
+                dash=dash,
+            )
+            for x, y, color, label in (
+                (hx, hy, head_color, f"{prefix}头"),
+                (tx, ty, tail_color, f"{prefix}尾"),
+            ):
+                canvas.create_oval(
+                    x - 7,
+                    y - 7,
+                    x + 7,
+                    y + 7,
+                    fill=color,
+                    outline="white",
+                    width=2,
+                )
+                canvas.create_text(
+                    x + 9,
+                    y - 9,
+                    text=label,
+                    fill=color,
+                    anchor=tk.SW,
+                    font=("Microsoft YaHei UI", 10, "bold"),
+                )
+
+        draw_direction(
+            model_head,
+            model_tail,
+            "#FFD166",
+            "#FF66CC",
+            "#FFB000",
+            "模型",
+            dash=(7, 4),
+        )
+        draw_direction(
+            manual_head,
+            manual_tail,
+            "#69F0AE",
+            "#FF4D4D",
+            "#00E5FF",
+            "标注",
+        )
+
+        active = self._active_direction_review_item()
+        is_target = bool(
+            active
+            and active["image_index"] == self.current_image_index
+            and active["rectangle_position"] == self.current_rectangle_index
+        )
+        target_text = "当前复审对象" if is_target else "上下文帧（A/D）"
+        score_text = ""
+        if model_head is not None and model_tail is not None:
+            current_angle = None
+            if manual_head is not None and manual_tail is not None:
+                current_angle = direction_angle_degrees(
+                    manual_head,
+                    manual_tail,
+                    model_head,
+                    model_tail,
+                )
+            current_angle_text = (
+                f"{current_angle:.1f}°" if current_angle is not None else "--"
+            )
+            score_text = (
+                f"模型置信度：头 {float(metadata.get('model_head_score', 0)):.2f}｜"
+                f"尾 {float(metadata.get('model_tail_score', 0)):.2f}｜"
+                f"原始误差 {float(metadata.get('model_angle_error_deg', 0)):.1f}°｜"
+                f"当前误差 {current_angle_text}"
+            )
+        card_width = min(canvas_width - 24, 650)
+        canvas.create_rectangle(
+            12,
+            12,
+            12 + card_width,
+            84,
+            fill="#101827",
+            outline="#FFC107" if is_target else "#8EC5FF",
+            width=2,
+        )
+        canvas.create_text(
+            24,
+            22,
+            text=(
+                f"{target_text}｜Track ID {rectangle.get('group_id')}｜"
+                f"帧 {metadata.get('frame', '')}"
+            ),
+            fill="#FFFFFF",
+            anchor=tk.NW,
+            font=("Microsoft YaHei UI", 12, "bold"),
+        )
+        canvas.create_text(
+            24,
+            51,
+            text=score_text or "当前帧没有模型预测坐标",
+            fill="#FFD166" if score_text else "#FF8A65",
+            anchor=tk.NW,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        canvas.create_text(
+            canvas_width - 14,
+            canvas_height - 12,
+            text="绿色实线：当前标注    黄色虚线：原模型预测",
+            fill="#FFFFFF",
+            anchor=tk.SE,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+
     def _draw_overview_position(
         self,
         position: int,
         rectangle: Dict,
         records: List[Dict],
+        show_box: bool = True,
     ) -> None:
         if self.overview_transform is None:
             return
@@ -3960,15 +5868,34 @@ class BeeKeypointAnnotator:
         x1, y1, x2, y2 = rectangle["rect"]
         cx1, cy1 = self._image_to_canvas((x1, y1), self.overview_transform)
         cx2, cy2 = self._image_to_canvas((x2, y2), self.overview_transform)
-        canvas.create_rectangle(
-            cx1,
-            cy1,
-            cx2,
-            cy2,
-            outline=outline,
-            width=2 if state == "pending" else 1,
-            tags=("overview_static", tag),
-        )
+        if show_box:
+            canvas.create_rectangle(
+                cx1,
+                cy1,
+                cx2,
+                cy2,
+                outline=outline,
+                width=2 if state == "pending" else 1,
+                tags=("overview_static", tag),
+            )
+            if self.show_track_ids.get():
+                self._draw_track_id_label(
+                    canvas,
+                    cx1 + 3,
+                    cy1 + 3,
+                    rectangle.get("group_id"),
+                    size=8,
+                    tags=("overview_static", tag),
+                )
+            if self.show_box_class_labels.get():
+                self._draw_box_class_label(
+                    canvas,
+                    cx1 + 3,
+                    cy1 + (18 if self.show_track_ids.get() else 3),
+                    rectangle.get("label"),
+                    size=8,
+                    tags=("overview_static", tag),
+                )
         scale = self.overview_transform[0]
         for record in records:
             x, y = self._image_to_canvas(record["point"], self.overview_transform)
@@ -3996,7 +5923,219 @@ class BeeKeypointAnnotator:
                     tags=("overview_static", tag),
                 )
 
+    def _draw_continuous_detail(self) -> None:
+        canvas = self.detail_canvas
+        canvas.delete("all")
+        image = self.current_pil_image
+        if image is None:
+            self.detail_transform = None
+            return
+
+        canvas_width = max(canvas.winfo_width(), 100)
+        canvas_height = max(canvas.winfo_height(), 100)
+        center = self.continuous_focus_point or (
+            float(image.width) / 2,
+            float(image.height) / 2,
+        )
+        zoom = min(12.0, max(1.0, float(self.continuous_zoom_factor)))
+        crop_width = float(image.width) / zoom
+        crop_height = float(image.height) / zoom
+        canvas_ratio = canvas_width / canvas_height
+        if crop_width / crop_height > canvas_ratio:
+            crop_height = min(float(image.height), crop_width / canvas_ratio)
+        else:
+            crop_width = min(float(image.width), crop_height * canvas_ratio)
+        crop_x1 = min(
+            max(float(center[0]) - crop_width / 2, 0.0),
+            max(0.0, float(image.width) - crop_width),
+        )
+        crop_y1 = min(
+            max(float(center[1]) - crop_height / 2, 0.0),
+            max(0.0, float(image.height) - crop_height),
+        )
+        crop_x2 = crop_x1 + crop_width
+        crop_y2 = crop_y1 + crop_height
+
+        scale = min(canvas_width / crop_width, canvas_height / crop_height) * 0.97
+        display_width = max(1, int(crop_width * scale))
+        display_height = max(1, int(crop_height * scale))
+        offset_x = (canvas_width - display_width) / 2
+        offset_y = (canvas_height - display_height) / 2
+        cache_key = (
+            "continuous",
+            id(image),
+            canvas_width,
+            canvas_height,
+            round(crop_x1, 3),
+            round(crop_y1, 3),
+            round(crop_x2, 3),
+            round(crop_y2, 3),
+            display_width,
+            display_height,
+        )
+        if cache_key != self.detail_cache_key:
+            crop = image.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+            resized = crop.resize(
+                (display_width, display_height), Image.Resampling.LANCZOS
+            )
+            self.detail_photo = ImageTk.PhotoImage(resized)
+            self.detail_cache_key = cache_key
+        canvas.create_image(offset_x, offset_y, image=self.detail_photo, anchor=tk.NW)
+        self.detail_transform = (
+            scale,
+            offset_x - crop_x1 * scale,
+            offset_y - crop_y1 * scale,
+        )
+
+        document = self._current_document()
+        rectangles = self._current_rectangles()
+        position = self._continuous_rectangle_position(document)
+        drag = getattr(self, "rectangle_drag", None)
+        highlight_position = (
+            drag["rectangle_position"]
+            if drag is not None
+            and drag.get("view") == "detail"
+            and drag.get("image_path") == self._current_image_path()
+            else self.current_rectangle_index
+        )
+        points_by_rectangle = (
+            keypoints_by_rectangle(document, rectangles) if document else {}
+        )
+        show_boxes = self.show_other_boxes.get()
+        for other_position, other_rectangle in enumerate(rectangles):
+            x1, y1, x2, y2 = other_rectangle["rect"]
+            if x2 < crop_x1 or x1 > crop_x2 or y2 < crop_y1 or y1 > crop_y2:
+                continue
+            self._draw_continuous_detail_position(
+                other_rectangle,
+                points_by_rectangle.get(other_position, []),
+                active=other_position == highlight_position,
+                show_box=show_boxes,
+            )
+
+        creation = getattr(self, "rectangle_creation", None)
+        if creation is not None and creation.get("view") == "detail":
+            cx1, cy1 = self._image_to_canvas(
+                creation["start"], self.detail_transform
+            )
+            cx2, cy2 = self._image_to_canvas(
+                creation["end"], self.detail_transform
+            )
+            canvas.create_rectangle(
+                cx1,
+                cy1,
+                cx2,
+                cy2,
+                outline="#00E5FF",
+                width=4,
+                dash=(8, 4),
+            )
+
+        instruction = (
+            "画框中：在左侧拖动完成检测框"
+            if self.continuous_draw_box_mode
+            else (
+                "右侧点击选区｜滚轮缩放｜A/D 前后帧｜R 画框｜"
+                "E 复制到下一帧｜V 下一个ID｜"
+                + (
+                    "H 隐藏全部框"
+                    if self.show_other_boxes.get()
+                    else "H 显示全部框"
+                )
+            )
+        )
+        canvas.create_text(
+            16,
+            16,
+            text=(
+                f"连续补标 ID {self.continuous_active_track_id}｜"
+                f"{zoom:.1f}×｜{instruction}"
+            ),
+            fill="#FFFFFF",
+            anchor=tk.NW,
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+
+    def _draw_continuous_detail_position(
+        self,
+        rectangle: Dict,
+        records: List[Dict],
+        active: bool,
+        show_box: bool = True,
+    ) -> None:
+        if self.detail_transform is None:
+            return
+        canvas = self.detail_canvas
+        state = self._keypoint_state(records, rectangle)
+        outline = {
+            "pending": "#FFC107",
+            "confirmed": "#69F0AE",
+            "partial": "#FF8A65",
+        }.get(state, "#55A7FF")
+        x1, y1, x2, y2 = rectangle["rect"]
+        cx1, cy1 = self._image_to_canvas((x1, y1), self.detail_transform)
+        cx2, cy2 = self._image_to_canvas((x2, y2), self.detail_transform)
+        if show_box:
+            canvas.create_rectangle(
+                cx1,
+                cy1,
+                cx2,
+                cy2,
+                outline=outline,
+                width=4 if active else 2,
+            )
+            if self.show_track_ids.get():
+                self._draw_track_id_label(
+                    canvas,
+                    cx1 + 5,
+                    cy1 + 5,
+                    rectangle.get("group_id"),
+                    size=11 if active else 9,
+                )
+            if self.show_box_class_labels.get():
+                self._draw_box_class_label(
+                    canvas,
+                    cx1 + 5,
+                    cy1 + (24 if self.show_track_ids.get() else 5),
+                    rectangle.get("label"),
+                    size=11 if active else 9,
+                )
+        if active and show_box:
+            self._draw_rectangle_handles(
+                canvas,
+                rectangle["rect"],
+                self.detail_transform,
+                outline,
+                size=6,
+            )
+        radius = 7 if active else 5
+        for record in records:
+            x, y = self._image_to_canvas(record["point"], self.detail_transform)
+            color = self._label_color(record["label"])
+            suggested = point_is_suggested(record)
+            canvas.create_oval(
+                x - radius,
+                y - radius,
+                x + radius,
+                y + radius,
+                fill="#FFD54F" if suggested else color,
+                outline=color if suggested else "white",
+                width=3 if active and suggested else 2,
+            )
+            if self.show_label_names.get():
+                canvas.create_text(
+                    x + radius + 3,
+                    y - radius - 1,
+                    text=record["label"] + ("（待确认）" if suggested else ""),
+                    fill=color,
+                    anchor=tk.SW,
+                    font=("Microsoft YaHei UI", 11 if active else 8, "bold"),
+                )
+
     def _draw_detail(self) -> None:
+        if getattr(self, "continuous_annotation_mode", False):
+            self._draw_continuous_detail()
+            return
         canvas = self.detail_canvas
         canvas.delete("all")
         image = self.current_pil_image
@@ -4037,6 +6176,22 @@ class BeeKeypointAnnotator:
         crop_x2 = min(float(image.width), view_x2 + padding_x)
         crop_y2 = min(float(image.height), view_y2 + padding_y)
 
+        view_key = (self._current_image_path(), self.current_rectangle_index)
+        view_center = getattr(self, "detail_view_centers", {}).get(view_key)
+        if view_center is not None:
+            crop_width = crop_x2 - crop_x1
+            crop_height = crop_y2 - crop_y1
+            crop_x1 = min(
+                max(float(view_center[0]) - crop_width / 2.0, 0.0),
+                max(0.0, float(image.width) - crop_width),
+            )
+            crop_y1 = min(
+                max(float(view_center[1]) - crop_height / 2.0, 0.0),
+                max(0.0, float(image.height) - crop_height),
+            )
+            crop_x2 = crop_x1 + crop_width
+            crop_y2 = crop_y1 + crop_height
+
         canvas_width = max(canvas.winfo_width(), 100)
         canvas_height = max(canvas.winfo_height(), 100)
         crop_width = max(1.0, crop_x2 - crop_x1)
@@ -4076,10 +6231,29 @@ class BeeKeypointAnnotator:
         cx1, cy1 = self._image_to_canvas((x1, y1), self.detail_transform)
         cx2, cy2 = self._image_to_canvas((x2, y2), self.detail_transform)
         document = self._current_document()
+        points_by_rectangle = (
+            keypoints_by_rectangle(document, rectangles) if document else {}
+        )
+        show_boxes = self.show_other_boxes.get()
+        for other_position, other_rectangle in enumerate(rectangles):
+            if other_position == self.current_rectangle_index:
+                continue
+            ox1, oy1, ox2, oy2 = other_rectangle["rect"]
+            if ox2 < crop_x1 or ox1 > crop_x2 or oy2 < crop_y1 or oy1 > crop_y2:
+                continue
+            self._draw_continuous_detail_position(
+                other_rectangle,
+                points_by_rectangle.get(other_position, []),
+                active=(
+                    self.rectangle_drag is not None
+                    and self.rectangle_drag.get("view") == "detail"
+                    and self.rectangle_drag.get("rectangle_position")
+                    == other_position
+                ),
+                show_box=show_boxes,
+            )
         current_records = (
-            keypoints_for_rectangle(document, self.current_rectangle_index)
-            if document
-            else []
+            points_by_rectangle.get(self.current_rectangle_index, [])
         )
         state = self._keypoint_state(
             current_records, rectangles[self.current_rectangle_index]
@@ -4089,14 +6263,38 @@ class BeeKeypointAnnotator:
             "confirmed": "#69F0AE",
             "partial": "#FF8A65",
         }.get(state, "#FFD54F")
-        canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=outline, width=4)
-        self._draw_rectangle_handles(
-            canvas,
-            rect,
-            self.detail_transform,
-            outline,
-            size=6,
+        current_is_drag_target = (
+            self.rectangle_drag is None
+            or self.rectangle_drag.get("view") != "detail"
+            or self.rectangle_drag.get("rectangle_position")
+            == self.current_rectangle_index
         )
+        if show_boxes:
+            canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=outline, width=4)
+            if self.show_track_ids.get():
+                self._draw_track_id_label(
+                    canvas,
+                    cx1 + 5,
+                    cy1 + 5,
+                    rectangles[self.current_rectangle_index].get("group_id"),
+                    size=11,
+                )
+            if self.show_box_class_labels.get():
+                self._draw_box_class_label(
+                    canvas,
+                    cx1 + 5,
+                    cy1 + (24 if self.show_track_ids.get() else 5),
+                    rectangles[self.current_rectangle_index].get("label"),
+                    size=11,
+                )
+            if current_is_drag_target:
+                self._draw_rectangle_handles(
+                    canvas,
+                    rect,
+                    self.detail_transform,
+                    outline,
+                    size=6,
+                )
 
         if document:
             for record in current_records:
@@ -4133,19 +6331,93 @@ class BeeKeypointAnnotator:
         )
 
     def _detail_operation_hint(self) -> str:
+        if getattr(self, "direction_review_mode", False):
+            return (
+                "方向复审：E 确认并进入下一个｜Q/W 上一个/下一个复审对象｜"
+                "A/D 查看相同 Track ID 前后帧｜X 交换头尾\n"
+                "左侧可直接修正关键点；右侧显示当前标注与原模型预测对照"
+            )
         if self.symmetry_enabled.get():
             return (
                 f"左键：标注 {self.active_label.get()} 并自动补 "
                 f"{self.symmetry_target_label.get()}"
                 f"（比例 {self.symmetry_ratio_text.get()}）    "
                 f"右键：手动标注 {self.symmetry_target_label.get()}    "
+                "Ctrl+右键框：改 ID    "
                 "中键：删除附近点    滚轮：切换检测框\n"
-                f"左键长按 {self.long_press_delay_ms}ms：框内移动｜八个白点缩放    Ctrl+拖动：立即调框"
+                "左键拖动框内：移动｜拖动白点：缩放    "
+                "单击：标点/选框    B：框 ID    Y：框类别    H：全部框"
             )
         return (
             f"左键：标注 {self.active_label.get()}    "
-            "右键：删除最近点    中键：删除附近点    滚轮：切换检测框\n"
-            f"左键长按 {self.long_press_delay_ms}ms：框内移动｜八个白点缩放    Ctrl+拖动：立即调框"
+            "右键：删除最近点    Ctrl+右键框：改 ID    "
+            "中键：删除附近点    滚轮：切换检测框\n"
+            "左键拖动框内：移动｜拖动白点：缩放    "
+            "单击：标点/选框    B：框 ID    Y：框类别    H：全部框"
+        )
+
+    @staticmethod
+    def _draw_track_id_label(
+        canvas: tk.Canvas,
+        x: float,
+        y: float,
+        group_id,
+        size: int,
+        tags=(),
+    ) -> None:
+        if group_id is None:
+            return
+        text = f"ID {group_id}"
+        font = ("Microsoft YaHei UI", size, "bold")
+        canvas.create_text(
+            x + 1,
+            y + 1,
+            text=text,
+            fill="#111111",
+            anchor=tk.NW,
+            font=font,
+            tags=tags,
+        )
+        canvas.create_text(
+            x,
+            y,
+            text=text,
+            fill="#FFFFFF",
+            anchor=tk.NW,
+            font=font,
+            tags=tags,
+        )
+
+    @staticmethod
+    def _draw_box_class_label(
+        canvas: tk.Canvas,
+        x: float,
+        y: float,
+        label,
+        size: int,
+        tags=(),
+    ) -> None:
+        text = str(label or "").strip()
+        if not text:
+            return
+        font = ("Microsoft YaHei UI", size, "bold")
+        canvas.create_text(
+            x + 1,
+            y + 1,
+            text=text,
+            fill="#111111",
+            anchor=tk.NW,
+            font=font,
+            tags=tags,
+        )
+        canvas.create_text(
+            x,
+            y,
+            text=text,
+            fill="#7FE7FF" if text.lower() == "beeshadow" else "#FFFFFF",
+            anchor=tk.NW,
+            font=font,
+            tags=tags,
         )
 
     @staticmethod
@@ -4222,6 +6494,41 @@ class BeeKeypointAnnotator:
             return
         current = self.current_rectangle_index + 1 if rectangles else 0
         points_by_rectangle = keypoints_by_rectangle(document, rectangles)
+        if getattr(self, "direction_review_mode", False):
+            items = self._direction_review_items()
+            reviewed = sum(not item["pending"] for item in items)
+            pending = len(items) - reviewed
+            self.confirmation_progress.set(
+                reviewed / len(items) * 100.0 if items else 0.0
+            )
+            active = self._active_direction_review_item()
+            self.progress_var.set(
+                f"方向复审  |  当前 {self.direction_review_item_index + 1}/"
+                f"{len(items)}  |  已完成 {reviewed}  |  剩余 {pending}"
+            )
+            if 0 <= self.current_rectangle_index < len(rectangles):
+                records = points_by_rectangle.get(self.current_rectangle_index, [])
+                group_id = rectangles[self.current_rectangle_index].get("group_id")
+                metadata = direction_review_metadata(
+                    rectangles[self.current_rectangle_index]
+                )
+                context = ""
+                if active and (
+                    active["image_index"] != self.current_image_index
+                    or active["rectangle_position"] != self.current_rectangle_index
+                ):
+                    context = "｜上下文帧"
+                self.points_var.set(
+                    f"ID {group_id}｜帧 {metadata.get('frame', '')}{context}｜"
+                    + "，".join(
+                        f"{record['label']}({record['point'][0]:.1f},"
+                        f"{record['point'][1]:.1f})"
+                        for record in records
+                    )
+                )
+            else:
+                self.points_var.set("当前帧没有对应 Track ID")
+            return
         if self.track_id_mode and self.track_mode_current_id is not None:
             stats = self._current_track_stats_for_display()
             occurrence_position = self._current_track_occurrence_position(
@@ -4551,12 +6858,11 @@ class BeeKeypointAnnotator:
   默认侧键 1 是上一个检测框，侧键 2 是下一个检测框。
   侧键只在本软件窗口内生效，可在“快捷键”窗口重新分配。
 
-鼠标左键长按拖动：
-  普通短按仍然标注关键点；长按达到设定延时后才进入调框模式。
-  在检测框内部长按：移动整个检测框。
-  在八个白色控制点上长按：按对应方向调整检测框大小。
-  长按延时可在“快捷键”窗口的“鼠标长按调框”中设置为 100～1000ms。
-  Ctrl + 左键拖动仍可作为无需等待的快速调框方式。
+鼠标左键直接拖动：
+  在检测框内部直接拖动：移动整个检测框，不需要按 Ctrl。
+  在八个白色控制点上直接拖动：按对应方向调整检测框大小。
+  单击其他框会先选中它并显示白色控制点；普通短按仍然用于标注关键点。
+  原有长按和 Ctrl + 左键拖动仍作为兼容操作保留。
   左侧放大视图和右侧鸟瞰图都可以操作。
   松开鼠标后自动保存；移动框时关键点同步平移，缩放框时关键点保持原图位置不变。
   如果调整错误，按 Ctrl+Z 撤销。
@@ -5289,12 +7595,37 @@ bee 检测框标签不受关键点标签管理影响。
         self.show_label_names.set(not self.show_label_names.get())
         self._refresh_all()
 
+    def toggle_box_class_labels(self) -> None:
+        visible = not self.show_box_class_labels.get()
+        self.show_box_class_labels.set(visible)
+        self.status_var.set(
+            f"检测框类别名称已{'显示' if visible else '隐藏'}"
+        )
+        self._save_settings()
+        self._refresh_all()
+
+    def toggle_track_ids(self) -> None:
+        visible = not self.show_track_ids.get()
+        self.show_track_ids.set(visible)
+        self.status_var.set(f"检测框 ID 已{'显示' if visible else '隐藏'}")
+        self._refresh_all()
+
     def toggle_other_boxes(self) -> None:
         self.show_other_boxes.set(not self.show_other_boxes.get())
         self._refresh_all()
 
+    def toggle_continuous_other_boxes(self) -> None:
+        visible = not self.show_other_boxes.get()
+        self.show_other_boxes.set(visible)
+        self.status_var.set(
+            f"全部检测框（含当前框）已{'显示' if visible else '隐藏'}；"
+            "关键点保持显示"
+        )
+        self._refresh_all()
+
     def _on_close(self) -> None:
         self._cancel_pointer_press()
+        self.rectangle_creation = None
         if self.rectangle_drag is not None:
             self._finish_rectangle_drag()
         self._auto_confirm_viewed_rectangle()
@@ -5309,7 +7640,8 @@ bee 检测框标签不受关键点标签管理影响。
 
 def main() -> None:
     root = tk.Tk()
-    BeeKeypointAnnotator(root)
+    initial_folder = Path(sys.argv[1]) if len(sys.argv) > 1 else None
+    BeeKeypointAnnotator(root, initial_folder=initial_folder)
     root.mainloop()
 
 

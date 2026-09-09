@@ -2,17 +2,26 @@ import copy
 import unittest
 
 from annotation_io import (
+    DIRECTION_REVIEW_DATA_KEY,
+    DIRECTION_REVIEW_REQUIRED_FLAG,
+    add_rectangle,
     add_or_replace_point,
     apply_transfer_plan,
     build_next_frame_transfer_plan,
     build_trackid_transfer_plan,
     build_transfer_plan,
+    change_rectangle_group_id,
+    confirm_direction_review_for_rectangle,
     confirm_keypoints_for_rectangle,
+    copy_rectangle_with_keypoints,
     delete_nearest_point,
+    delete_rectangle_with_keypoints,
     keypoints_by_rectangle,
     keypoints_for_rectangle,
     point_is_suggested,
     rectangle_records,
+    rectangle_direction_review_is_pending,
+    rectangle_is_direction_review_item,
     rectangle_review_is_pending,
     review_progress,
     set_rectangle_bounds,
@@ -20,6 +29,7 @@ from annotation_io import (
 )
 from core import (
     adjust_rectangle_bounds,
+    direction_angle_degrees,
     greedy_iou_match,
     iou,
     point_from_relative,
@@ -42,12 +52,28 @@ def rectangle(label, x1, y1, x2, y2, group_id=None):
 
 
 class CoreGeometryTests(unittest.TestCase):
+    def test_direction_angle_degrees(self):
+        self.assertAlmostEqual(
+            direction_angle_degrees((0, 0), (1, 0), (0, 0), (2, 0)),
+            0.0,
+        )
+        self.assertAlmostEqual(
+            direction_angle_degrees((0, 0), (1, 0), (0, 0), (-1, 0)),
+            180.0,
+        )
+        self.assertAlmostEqual(
+            direction_angle_degrees((0, 0), (1, 0), (0, 0), (0, 1)),
+            90.0,
+        )
+        self.assertIsNone(
+            direction_angle_degrees((0, 0), (0, 0), (0, 0), (1, 0))
+        )
+
     def test_rect_bounds_accepts_four_points(self):
         self.assertEqual(
             rect_bounds([[10, 20], [30, 20], [30, 50], [10, 50]]),
             (10.0, 20.0, 30.0, 50.0),
         )
-
     def test_iou(self):
         score = iou((0, 0, 10, 10), (5, 5, 15, 15))
         self.assertAlmostEqual(score, 25 / 175)
@@ -128,6 +154,22 @@ class CoreGeometryTests(unittest.TestCase):
         self.assertEqual(minimum, (24, 44, 30, 50))
 
 
+class DirectionReviewTests(unittest.TestCase):
+    def test_direction_review_confirmation_only_clears_second_review_flag(self):
+        shape = rectangle("bee", 0, 0, 20, 20, group_id=7)
+        shape["attributes"] = {
+            DIRECTION_REVIEW_DATA_KEY: {"review_item": True}
+        }
+        shape["flags"][DIRECTION_REVIEW_REQUIRED_FLAG] = True
+        document = {"shapes": [shape]}
+
+        self.assertTrue(rectangle_is_direction_review_item(document, 0))
+        self.assertTrue(rectangle_direction_review_is_pending(document, 0))
+        self.assertTrue(confirm_direction_review_for_rectangle(document, 0))
+        self.assertFalse(rectangle_direction_review_is_pending(document, 0))
+        self.assertFalse(confirm_direction_review_for_rectangle(document, 0))
+
+
 class AnnotationTransferTests(unittest.TestCase):
     def setUp(self):
         self.source = {
@@ -152,6 +194,43 @@ class AnnotationTransferTests(unittest.TestCase):
             rectangle_records(self.source)[0]["shape"]["group_id"],
             records[0]["shape"]["group_id"],
         )
+
+    def test_new_rectangle_uses_standard_shape_and_track_id(self):
+        document = {"shapes": []}
+        position = add_rectangle(document, (10, 20, 30, 50), 17)
+        record = rectangle_records(document)[position]
+
+        self.assertEqual(record["label"], "bee")
+        self.assertEqual(record["group_id"], 17)
+        self.assertEqual(record["rect"], (10.0, 20.0, 30.0, 50.0))
+        self.assertEqual(record["shape"]["attributes"], {})
+        self.assertEqual(record["shape"]["kie_linking"], [])
+
+        add_or_replace_point(document, position, "head", (15, 25))
+        point = keypoints_for_rectangle(document, position)[0]
+        self.assertEqual(point["group_id"], 17)
+
+    def test_copy_rectangle_with_keypoints_marks_target_as_suggested(self):
+        source = {"shapes": []}
+        source_position = add_rectangle(source, (10, 20, 30, 50), 21)
+        add_or_replace_point(source, source_position, "head", (15, 25))
+        add_or_replace_point(source, source_position, "tail", (25, 45))
+        target = {"shapes": []}
+
+        target_position = copy_rectangle_with_keypoints(
+            source,
+            source_position,
+            target,
+            suggested=True,
+        )
+
+        self.assertEqual(
+            rectangle_records(target)[target_position]["group_id"], 21
+        )
+        self.assertTrue(rectangle_review_is_pending(target, target_position))
+        points = keypoints_for_rectangle(target, target_position)
+        self.assertEqual({record["label"] for record in points}, {"head", "tail"})
+        self.assertTrue(all(point_is_suggested(record) for record in points))
 
     def test_keypoints_are_grouped_in_one_pass(self):
         add_or_replace_point(self.source, 0, "head", (2, 4))
@@ -218,6 +297,39 @@ class AnnotationTransferTests(unittest.TestCase):
         point = keypoints_for_rectangle(self.source, 0)[0]
         self.assertEqual(point["point"], (2.0, 4.0))
         self.assertEqual(point["group_id"], 19)
+
+    def test_delete_rectangle_removes_only_its_associated_keypoints(self):
+        add_or_replace_point(self.source, 0, "head", (2, 4))
+        add_or_replace_point(self.source, 0, "tail", (8, 16))
+        add_or_replace_point(self.source, 1, "head", (32, 4))
+
+        self.assertEqual(delete_rectangle_with_keypoints(self.source, 0), 3)
+        self.assertEqual(len(rectangle_records(self.source)), 1)
+        remaining_points = keypoints_for_rectangle(self.source, 0)
+        self.assertEqual([record["label"] for record in remaining_points], ["head"])
+        self.assertEqual(remaining_points[0]["point"], (32.0, 4.0))
+
+    def test_change_rectangle_group_id_updates_only_its_box_and_keypoints(self):
+        document = {"shapes": []}
+        first = add_rectangle(document, (0, 0, 20, 20), 19)
+        second = add_rectangle(document, (30, 0, 50, 20), 20)
+        add_or_replace_point(document, first, "head", (5, 5))
+        add_or_replace_point(document, first, "tail", (15, 15))
+        add_or_replace_point(document, second, "head", (35, 5))
+
+        self.assertEqual(change_rectangle_group_id(document, first, 23), 3)
+        self.assertEqual(rectangle_records(document)[first]["group_id"], 23)
+        self.assertTrue(
+            all(
+                record["group_id"] == 23
+                for record in keypoints_for_rectangle(document, first)
+            )
+        )
+        self.assertEqual(rectangle_records(document)[second]["group_id"], 20)
+        self.assertEqual(keypoints_for_rectangle(document, second)[0]["group_id"], 20)
+
+        with self.assertRaises(ValueError):
+            change_rectangle_group_id(document, first, 0)
 
 
 class TrackIdTransferTests(unittest.TestCase):

@@ -1,10 +1,32 @@
 """与界面无关的几何算法。"""
 
-from typing import Dict, Iterable, List, Sequence, Tuple
+import math
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 Point = Tuple[float, float]
 Rect = Tuple[float, float, float, float]
+
+
+def direction_angle_degrees(
+    first_head: Sequence[float],
+    first_tail: Sequence[float],
+    second_head: Sequence[float],
+    second_tail: Sequence[float],
+) -> Optional[float]:
+    """计算两条“头指向尾”方向向量之间的夹角，范围为 0～180°。"""
+    first_x = float(first_tail[0]) - float(first_head[0])
+    first_y = float(first_tail[1]) - float(first_head[1])
+    second_x = float(second_tail[0]) - float(second_head[0])
+    second_y = float(second_tail[1]) - float(second_head[1])
+    first_length = math.hypot(first_x, first_y)
+    second_length = math.hypot(second_x, second_y)
+    if first_length <= 1e-9 or second_length <= 1e-9:
+        return None
+    cosine = (first_x * second_x + first_y * second_y) / (
+        first_length * second_length
+    )
+    return math.degrees(math.acos(min(1.0, max(-1.0, cosine))))
 
 
 def rect_bounds(points: Sequence[Sequence[float]]) -> Rect:

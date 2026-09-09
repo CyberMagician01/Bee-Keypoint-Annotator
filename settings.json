@@ -10,6 +10,7 @@
   "show_label_names": false,
   "show_other_boxes": true,
   "iou_threshold": 0.5,
+  "long_press_delay_ms": 250,
   "shortcuts": {
     "previous_image": [
       "Z",
@@ -91,6 +92,10 @@
       "D",
       "无"
     ],
+    "next_track_id": [
+      "W",
+      "无"
+    ],
     "copy_frame_to_next": [
       "R",
       "无"
@@ -116,5 +121,5 @@
       "无"
     ]
   },
-  "default_folder": "C:\\BeeAnnotationData"
+  "default_folder": ""
 }

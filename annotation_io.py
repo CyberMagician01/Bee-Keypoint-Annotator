@@ -1,5 +1,6 @@
 """X-AnyLabeling/LabelMe JSON 的读取、保存与关键点关联。"""
 
+import copy
 import json
 import os
 import shutil
@@ -19,6 +20,8 @@ from core import (
 
 SUGGESTED_KEYPOINT_FLAG = "bee_keypoint_suggested"
 REVIEW_REQUIRED_FLAG = "bee_keypoint_review_required"
+DIRECTION_REVIEW_REQUIRED_FLAG = "bee_direction_review_required"
+DIRECTION_REVIEW_DATA_KEY = "bee_direction_review"
 
 
 def json_path_for_image(image_path: Path) -> Path:
@@ -189,6 +192,115 @@ def set_rectangle_bounds(
     return True
 
 
+def change_rectangle_group_id(
+    document: Dict,
+    rectangle_position: int,
+    new_group_id: int,
+) -> int:
+    """修改一个检测框及其关联关键点的 Track ID，返回修改的 shape 数。"""
+    if (
+        not isinstance(new_group_id, int)
+        or isinstance(new_group_id, bool)
+        or new_group_id <= 0
+    ):
+        raise ValueError("ID 必须是大于 0 的整数")
+
+    rectangles = rectangle_records(document)
+    if not 0 <= rectangle_position < len(rectangles):
+        raise ValueError("检测框已不存在")
+
+    rectangle = rectangles[rectangle_position]
+    related_points = keypoints_for_rectangle(document, rectangle_position)
+    shape_indices = {rectangle["shape_index"]}
+    shape_indices.update(record["shape_index"] for record in related_points)
+
+    changes = 0
+    shapes = document.get("shapes", [])
+    for shape_index in shape_indices:
+        if not 0 <= shape_index < len(shapes):
+            continue
+        if shapes[shape_index].get("group_id") == new_group_id:
+            continue
+        shapes[shape_index]["group_id"] = new_group_id
+        changes += 1
+    return changes
+
+
+def make_rectangle_shape(
+    bounds: Tuple[float, float, float, float],
+    group_id,
+    label: str = "bee",
+) -> Dict:
+    """创建兼容 X-AnyLabeling/LabelMe 的标准矩形标注。"""
+    x1, y1, x2, y2 = (float(value) for value in bounds)
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("矩形右下角必须位于左上角的右下方")
+    return {
+        "kie_linking": [],
+        "label": str(label or "bee"),
+        "score": None,
+        "points": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+        "group_id": group_id,
+        "description": "",
+        "difficult": False,
+        "shape_type": "rectangle",
+        "flags": {},
+        "attributes": {},
+    }
+
+
+def add_rectangle(
+    document: Dict,
+    bounds: Tuple[float, float, float, float],
+    group_id,
+    label: str = "bee",
+) -> int:
+    """新增矩形并返回它在 rectangle_records 中的位置。"""
+    document.setdefault("shapes", []).append(
+        make_rectangle_shape(bounds, group_id, label=label)
+    )
+    return len(rectangle_records(document)) - 1
+
+
+def copy_rectangle_with_keypoints(
+    source_document: Dict,
+    source_rectangle_position: int,
+    target_document: Dict,
+    suggested: bool = True,
+) -> int:
+    """把一个检测框及其关键点完整复制到目标帧，返回新框位置。"""
+    source_rectangles = rectangle_records(source_document)
+    if not 0 <= source_rectangle_position < len(source_rectangles):
+        return -1
+
+    source_rectangle = source_rectangles[source_rectangle_position]
+    rectangle_shape = copy.deepcopy(source_rectangle["shape"])
+    group_id = rectangle_shape.get("group_id")
+    if suggested:
+        rectangle_shape.setdefault("flags", {})[REVIEW_REQUIRED_FLAG] = True
+    rectangle_shape.setdefault("flags", {}).pop(
+        DIRECTION_REVIEW_REQUIRED_FLAG, None
+    )
+    rectangle_shape.setdefault("attributes", {}).pop(
+        DIRECTION_REVIEW_DATA_KEY, None
+    )
+
+    target_document.setdefault("shapes", []).append(rectangle_shape)
+    new_position = len(rectangle_records(target_document)) - 1
+    for record in keypoints_for_rectangle(
+        source_document, source_rectangle_position
+    ):
+        point_shape = copy.deepcopy(record["shape"])
+        point_shape["group_id"] = group_id
+        flags = point_shape.setdefault("flags", {})
+        if suggested:
+            flags[SUGGESTED_KEYPOINT_FLAG] = True
+        else:
+            flags.pop(SUGGESTED_KEYPOINT_FLAG, None)
+        target_document["shapes"].append(point_shape)
+    return new_position
+
+
 def make_point_shape(
     label: str,
     point: Tuple[float, float],
@@ -297,6 +409,52 @@ def rectangle_review_is_pending(document: Dict, rectangle_position: int) -> bool
     )
 
 
+def direction_review_metadata(rectangle_or_shape: Dict) -> Dict:
+    shape = rectangle_or_shape.get("shape", rectangle_or_shape)
+    metadata = shape.get("attributes", {}).get(DIRECTION_REVIEW_DATA_KEY, {})
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def rectangle_is_direction_review_item(
+    document: Dict, rectangle_position: int
+) -> bool:
+    rectangles = rectangle_records(document)
+    if not 0 <= rectangle_position < len(rectangles):
+        return False
+    return bool(direction_review_metadata(rectangles[rectangle_position]).get("review_item"))
+
+
+def rectangle_direction_review_is_pending(
+    document: Dict, rectangle_position: int
+) -> bool:
+    rectangles = rectangle_records(document)
+    if not 0 <= rectangle_position < len(rectangles):
+        return False
+    rectangle = rectangles[rectangle_position]
+    return bool(
+        direction_review_metadata(rectangle).get("review_item")
+        and rectangle["shape"].get("flags", {}).get(
+            DIRECTION_REVIEW_REQUIRED_FLAG, False
+        )
+    )
+
+
+def confirm_direction_review_for_rectangle(
+    document: Dict, rectangle_position: int
+) -> bool:
+    rectangles = rectangle_records(document)
+    if not 0 <= rectangle_position < len(rectangles):
+        return False
+    rectangle = rectangles[rectangle_position]
+    if not direction_review_metadata(rectangle).get("review_item"):
+        return False
+    flags = rectangle["shape"].setdefault("flags", {})
+    if not flags.get(DIRECTION_REVIEW_REQUIRED_FLAG, False):
+        return False
+    flags[DIRECTION_REVIEW_REQUIRED_FLAG] = False
+    return True
+
+
 def review_progress(document: Dict) -> Dict[str, int]:
     rectangles = rectangle_records(document)
     points_by_rectangle = keypoints_by_rectangle(document, rectangles)
@@ -384,6 +542,28 @@ def delete_points(
         document["shapes"] = [
             shape for shape in document["shapes"] if id(shape) not in removable_ids
         ]
+    return len(removable_ids)
+
+
+def delete_rectangle_with_keypoints(
+    document: Dict,
+    rectangle_position: int,
+) -> int:
+    """删除指定检测框及其关联关键点，返回删除的图形总数。"""
+    rectangles = rectangle_records(document)
+    if not 0 <= rectangle_position < len(rectangles):
+        return 0
+
+    removable_ids = {
+        id(record["shape"])
+        for record in keypoints_for_rectangle(document, rectangle_position)
+    }
+    removable_ids.add(id(rectangles[rectangle_position]["shape"]))
+    document["shapes"] = [
+        shape
+        for shape in document.get("shapes", [])
+        if id(shape) not in removable_ids
+    ]
     return len(removable_ids)
 
 

@@ -17,12 +17,25 @@ from annotation_io import (
 from app import BeeKeypointAnnotator, DEFAULT_SHORTCUTS, win32gui
 
 
+def rectangle(label, x1, y1, x2, y2, group_id=None):
+    return {
+        "label": label,
+        "points": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+        "group_id": group_id,
+        "shape_type": "rectangle",
+        "flags": {},
+    }
+
+
 class FakeVariable:
     def __init__(self):
         self.value = ""
 
     def set(self, value):
         self.value = value
+
+    def get(self):
+        return self.value
 
 
 class FakeAfterRoot:
@@ -38,6 +51,22 @@ class FakeAfterRoot:
 
     def after_cancel(self, job):
         self.cancelled.append(job)
+
+
+class FakeCanvas:
+    def __init__(self, width=200, height=100):
+        self.width = width
+        self.height = height
+        self.cursor = None
+
+    def winfo_width(self):
+        return self.width
+
+    def winfo_height(self):
+        return self.height
+
+    def configure(self, **kwargs):
+        self.cursor = kwargs.get("cursor", self.cursor)
 
 
 class ShortcutTests(unittest.TestCase):
@@ -56,6 +85,7 @@ class ShortcutTests(unittest.TestCase):
         app.long_press_delay_ms = 250
         app.status_var = FakeVariable()
         app._current_image_path = lambda: Path("frame.jpg")
+        app._rectangle_drag_candidate_at = lambda *_args: (-1, "")
         clicks = []
         app._on_detail_click = clicks.append
         event = type("Event", (), {"x": 20, "y": 30, "state": 0})()
@@ -75,6 +105,7 @@ class ShortcutTests(unittest.TestCase):
         app.long_press_delay_ms = 300
         app.status_var = FakeVariable()
         app._current_image_path = lambda: Path("frame.jpg")
+        app._rectangle_drag_candidate_at = lambda *_args: (-1, "")
         starts = []
         moves = []
         app._begin_rectangle_drag_at = (
@@ -97,6 +128,124 @@ class ShortcutTests(unittest.TestCase):
         self.assertEqual(moves, [(40.0, 45.0, "detail")])
         self.assertIsNone(app.pointer_press)
 
+    def test_plain_drag_inside_box_starts_move_without_ctrl_or_long_press(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.root = FakeAfterRoot()
+        app.pointer_press = None
+        app.rectangle_drag = None
+        app.long_press_delay_ms = 300
+        app._current_image_path = lambda: Path("frame.jpg")
+        app._rectangle_drag_candidate_at = lambda *_args: (1, "move")
+        starts = []
+        moves = []
+        app._begin_rectangle_drag_at = (
+            lambda x, y, view, handle_only: starts.append(
+                (x, y, view, handle_only)
+            )
+            or True
+        )
+        app._continue_rectangle_drag_at = (
+            lambda x, y, view: moves.append((x, y, view)) or "break"
+        )
+        press = type("Event", (), {"x": 10, "y": 15, "state": 0})()
+        motion = type("Event", (), {"x": 30, "y": 35, "state": 0})()
+
+        app._on_pointer_press(press, "detail")
+        result = app._on_pointer_motion(motion, "detail")
+
+        self.assertEqual(result, "break")
+        self.assertEqual(starts, [(10.0, 15.0, "detail", False)])
+        self.assertEqual(moves, [(30.0, 35.0, "detail")])
+        self.assertEqual(app.root.cancelled, ["after-job"])
+
+    def test_plain_press_on_resize_handle_starts_resize_immediately(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.root = FakeAfterRoot()
+        app.pointer_press = None
+        app.rectangle_drag = None
+        app._rectangle_drag_candidate_at = lambda *_args: (1, "nw")
+        starts = []
+        app._begin_rectangle_drag_at = (
+            lambda x, y, view, handle_only: starts.append(
+                (x, y, view, handle_only)
+            )
+            or True
+        )
+        event = type("Event", (), {"x": 20, "y": 25, "state": 0})()
+
+        result = app._on_pointer_press(event, "detail")
+
+        self.assertEqual(result, "break")
+        self.assertEqual(starts, [(20.0, 25.0, "detail", False)])
+        self.assertIsNone(app.pointer_press)
+
+    def test_plain_click_on_other_box_is_forwarded_to_keypoint_action(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.root = FakeAfterRoot()
+        app.pointer_press = None
+        app.rectangle_drag = None
+        app.long_press_delay_ms = 300
+        app.current_rectangle_index = 0
+        app._current_image_path = lambda: Path("frame.jpg")
+        app._rectangle_drag_candidate_at = lambda *_args: (1, "move")
+        calls = []
+        app._auto_confirm_viewed_rectangle = lambda: calls.append("confirm")
+        app._remember_current_rectangle = lambda: calls.append("remember")
+        app._refresh_all = lambda: calls.append("refresh")
+        app._on_detail_click = lambda _event: calls.append("point")
+        app.status_var = FakeVariable()
+        event = type("Event", (), {"x": 20, "y": 25, "state": 0})()
+
+        app._on_pointer_press(event, "detail")
+        result = app._on_pointer_release(event, "detail")
+
+        self.assertEqual(result, "break")
+        self.assertEqual(app.current_rectangle_index, 0)
+        self.assertEqual(calls, ["point"])
+
+    def test_detail_click_selects_other_box_and_adds_keypoint_in_one_click(self):
+        document = {
+            "shapes": [
+                rectangle("bee", 0, 0, 10, 10, group_id=1),
+                rectangle("bee", 20, 0, 30, 10, group_id=2),
+            ]
+        }
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.detail_transform = (1, 0, 0)
+        app.current_rectangle_index = 0
+        app.show_other_boxes = FakeVariable()
+        app.show_other_boxes.set(True)
+        app.active_label = FakeVariable()
+        app.active_label.set("head")
+        app.symmetry_enabled = FakeVariable()
+        app.symmetry_enabled.set(False)
+        app.symmetry_source_label = FakeVariable()
+        app.symmetry_target_label = FakeVariable()
+        app.symmetry_ratio = FakeVariable()
+        app.status_var = FakeVariable()
+        app._current_document = lambda: document
+        app._current_rectangles = lambda: rectangle_records(document)
+        calls = []
+        app._auto_confirm_viewed_rectangle = lambda: calls.append("confirm")
+        app._remember_current_rectangle = lambda: calls.append("remember")
+        app._push_undo = lambda: calls.append("undo")
+        app._mark_dirty = lambda: calls.append("dirty")
+        app._schedule_autosave = lambda: calls.append("autosave")
+        app._refresh_all = lambda: calls.append("refresh")
+        event = type("Event", (), {"x": 25, "y": 5, "state": 0})()
+
+        app._on_detail_click(event)
+
+        self.assertEqual(app.current_rectangle_index, 1)
+        points = keypoints_for_rectangle(document, 1)
+        self.assertEqual(len(points), 1)
+        self.assertEqual(points[0]["label"], "head")
+        self.assertEqual(points[0]["point"], (25.0, 5.0))
+        self.assertEqual(
+            calls,
+            ["confirm", "remember", "undo", "dirty", "autosave", "refresh"],
+        )
+
     def test_default_side_buttons_switch_rectangles(self):
         self.assertIn("鼠标侧键1", DEFAULT_SHORTCUTS["previous_rectangle"])
         self.assertIn("鼠标侧键2", DEFAULT_SHORTCUTS["next_rectangle"])
@@ -118,6 +267,541 @@ class ShortcutTests(unittest.TestCase):
         self.assertIn("Space", DEFAULT_SHORTCUTS["confirm_keypoints"])
         self.assertIn("X", DEFAULT_SHORTCUTS["swap_head_tail"])
         self.assertIn("N", DEFAULT_SHORTCUTS["next_review_issue"])
+        self.assertIn("V", DEFAULT_SHORTCUTS["start_continuous_annotation"])
+        self.assertIn("B", DEFAULT_SHORTCUTS["toggle_track_ids"])
+        self.assertIn("F", DEFAULT_SHORTCUTS["toggle_bee_shadow_class"])
+        self.assertIn("Y", DEFAULT_SHORTCUTS["toggle_box_class_labels"])
+        self.assertEqual(DEFAULT_SHORTCUTS["clear_default_track_id"], ["无", "无"])
+        self.assertIn("H", DEFAULT_SHORTCUTS["toggle_continuous_other_boxes"])
+
+    def test_detail_drag_can_target_another_visible_rectangle(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.current_rectangle_index = 0
+        rectangles = [
+            {"rect": (0, 0, 10, 10)},
+            {"rect": (20, 0, 30, 10)},
+        ]
+
+        self.assertEqual(
+            app._rectangle_drag_target(
+                (25, 5), "detail", rectangles, tolerance=1, handle_only=False
+            ),
+            (1, "move"),
+        )
+        self.assertEqual(
+            app._rectangle_drag_target(
+                (20, 0), "detail", rectangles, tolerance=1, handle_only=True
+            ),
+            (1, "nw"),
+        )
+
+    def test_plain_right_click_marks_tail_on_clicked_box(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.detail_transform = (1, 0, 0)
+        app.current_rectangle_index = 0
+        app._current_document = lambda: {"shapes": []}
+        app._current_rectangles = lambda: [{"rect": (0, 0, 10, 10)}]
+        app._control_pressed = lambda _event: False
+        app.show_other_boxes = FakeVariable()
+        app.show_other_boxes.set(True)
+        actions = []
+        app._apply_detail_right_click_point_action = (
+            lambda point, position: actions.append((point, position))
+        )
+        event = type("Event", (), {"x": 5, "y": 6, "state": 0})()
+
+        self.assertEqual(app._on_detail_right_click(event), "break")
+        self.assertEqual(actions, [((5.0, 6.0), 0)])
+
+    def test_ctrl_right_click_opens_menu_for_clicked_other_box(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.detail_transform = (1, 0, 0)
+        app.current_rectangle_index = 0
+        app._current_document = lambda: {"shapes": []}
+        app._current_rectangles = lambda: [
+            {"rect": (0, 0, 10, 10)},
+            {"rect": (20, 0, 30, 10)},
+        ]
+        app._control_pressed = lambda _event: True
+        app.show_other_boxes = FakeVariable()
+        app.show_other_boxes.set(True)
+        calls = []
+        app._show_detail_rectangle_context_menu = lambda event, point, position: calls.append(
+            (event, point, position)
+        )
+        event = type("Event", (), {"x": 25, "y": 5, "state": 0})()
+
+        self.assertEqual(app._on_detail_right_click(event), "break")
+        self.assertEqual(calls, [(event, (25.0, 5.0), 1)])
+
+    def test_context_menu_delete_removes_box_and_points_and_schedules_save(self):
+        document = {"shapes": [rectangle("bee", 0, 0, 10, 10, group_id=7)]}
+        add_or_replace_point(document, 0, "head", (2, 3))
+        add_or_replace_point(document, 0, "tail", (8, 7))
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.current_rectangle_index = 0
+        app.overview_static_key = "cached"
+        app.status_var = FakeVariable()
+        app._current_document = lambda: document
+        app._current_rectangles = lambda: rectangle_records(document)
+        calls = []
+        app._remember_current_rectangle = lambda: calls.append("remember")
+        app._push_undo = lambda: calls.append("undo")
+        app._discard_last_undo = lambda: calls.append("discard")
+        app._mark_dirty = lambda: calls.append("dirty")
+        app._schedule_autosave = lambda: calls.append("autosave")
+        app._refresh_all = lambda: calls.append("refresh")
+
+        with patch("app.messagebox.askyesno", return_value=True):
+            app._delete_rectangle_with_keypoints(0)
+
+        self.assertEqual(document["shapes"], [])
+        self.assertEqual(app.current_rectangle_index, -1)
+        self.assertIsNone(app.overview_static_key)
+        self.assertEqual(
+            calls,
+            ["remember", "undo", "remember", "dirty", "autosave", "refresh"],
+        )
+
+    def test_plain_right_click_adds_tail_even_when_symmetry_is_disabled(self):
+        document = {"shapes": [rectangle("bee", 0, 0, 10, 10, group_id=7)]}
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.current_rectangle_index = 0
+        app.symmetry_enabled = FakeVariable()
+        app.symmetry_enabled.set(False)
+        app.symmetry_target_label = FakeVariable()
+        app.symmetry_target_label.set("tail")
+        app.status_var = FakeVariable()
+        app._current_document = lambda: document
+        app._current_rectangles = lambda: rectangle_records(document)
+        app._remember_current_rectangle = lambda: None
+        app._push_undo = lambda: None
+        app._mark_dirty = lambda: None
+        app._schedule_autosave = lambda: None
+        app._refresh_all = lambda: None
+
+        app._apply_detail_right_click_point_action((6, 7), 0)
+
+        points = keypoints_for_rectangle(document, 0)
+        self.assertEqual(len(points), 1)
+        self.assertEqual(points[0]["label"], "tail")
+        self.assertEqual(points[0]["point"], (6.0, 7.0))
+
+    def test_middle_drag_pans_continuous_detail_view(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.detail_transform = (2.0, 0.0, 0.0)
+        app.detail_canvas = FakeCanvas(200, 100)
+        app.current_pil_image = type("Image", (), {"width": 500, "height": 300})()
+        app.current_rectangle_index = 0
+        app.continuous_annotation_mode = True
+        app.continuous_focus_point = (50.0, 25.0)
+        app.middle_pan = None
+        app.detail_cache_key = "cached"
+        app.status_var = FakeVariable()
+        app._current_image_path = lambda: Path("frame.jpg")
+        draws = []
+        app._draw_detail = lambda: draws.append(True)
+        press = type("Event", (), {"x": 100, "y": 50})()
+        motion = type("Event", (), {"x": 120, "y": 60})()
+
+        app._on_detail_middle_press(press)
+        app._on_detail_middle_motion(motion)
+
+        self.assertEqual(app.continuous_focus_point, (40.0, 20.0))
+        self.assertIsNone(app.detail_cache_key)
+        self.assertEqual(draws, [True])
+        self.assertEqual(app.detail_canvas.cursor, "fleur")
+
+    def test_middle_click_without_drag_keeps_delete_action(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.detail_transform = (1.0, 0.0, 0.0)
+        app.detail_canvas = FakeCanvas(200, 100)
+        app.current_pil_image = type("Image", (), {"width": 500, "height": 300})()
+        app.current_rectangle_index = 0
+        app.middle_pan = None
+        app.status_var = FakeVariable()
+        app._current_image_path = lambda: Path("frame.jpg")
+        deleted = []
+        app._on_detail_middle_click = lambda event: deleted.append(event)
+        event = type("Event", (), {"x": 100, "y": 50})()
+
+        app._on_detail_middle_press(event)
+        app._on_detail_middle_release(event)
+
+        self.assertEqual(deleted, [event])
+        self.assertEqual(app.detail_canvas.cursor, "crosshair")
+
+    def test_batch_delete_removes_same_id_from_current_and_later_frames(self):
+        first = Path("frame_001.jpg")
+        second = Path("frame_002.jpg")
+        third = Path("frame_003.jpg")
+        documents = {
+            first: {"shapes": [rectangle("bee", 0, 0, 10, 10, group_id=7)]},
+            second: {"shapes": [rectangle("bee", 0, 0, 10, 10, group_id=7)]},
+            third: {
+                "shapes": [
+                    rectangle("bee", 0, 0, 10, 10, group_id=7),
+                    rectangle("bee", 20, 0, 30, 10, group_id=8),
+                ]
+            },
+        }
+        add_or_replace_point(documents[second], 0, "head", (2, 3))
+        add_or_replace_point(documents[third], 0, "tail", (7, 8))
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.images = [first, second, third]
+        app.documents = documents
+        app.current_image_index = 1
+        app.current_rectangle_index = 0
+        app.dirty_images = set()
+        app.overview_static_key = "cached"
+        app.detail_cache_key = "cached"
+        app.root = object()
+        app.status_var = FakeVariable()
+        app._current_image_path = lambda: second
+        app._current_document = lambda: documents[second]
+        app._current_rectangles = lambda: rectangle_records(documents[second])
+        app._get_document = lambda image_path: documents[image_path]
+        calls = []
+        app._push_undo = lambda image_path=None: calls.append(("undo", image_path))
+        app._remember_current_rectangle = lambda: calls.append("remember")
+        app._schedule_autosave = lambda: calls.append("autosave")
+        app._refresh_all = lambda: calls.append("refresh")
+
+        with patch("app.messagebox.askyesno", return_value=True):
+            app._delete_current_and_following_track_boxes(0)
+
+        self.assertEqual(len(rectangle_records(documents[first])), 1)
+        self.assertEqual(len(rectangle_records(documents[second])), 0)
+        self.assertEqual(
+            [record["group_id"] for record in rectangle_records(documents[third])],
+            [8],
+        )
+        self.assertEqual(app.dirty_images, {second, third})
+        self.assertEqual(app.current_rectangle_index, -1)
+        self.assertEqual(calls[-3:], ["remember", "autosave", "refresh"])
+
+    def test_f_action_toggles_current_box_between_bee_and_beeshadow(self):
+        document = {
+            "shapes": [rectangle("bee", 0, 0, 10, 10, group_id=7)]
+        }
+        add_or_replace_point(document, 0, "head", (2, 3))
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.current_rectangle_index = 0
+        app.overview_static_key = "cached"
+        app.status_var = FakeVariable()
+        app._current_document = lambda: document
+        app._current_rectangles = lambda: rectangle_records(document)
+        calls = []
+        app._push_undo = lambda: calls.append("undo")
+        app._mark_dirty = lambda: calls.append("dirty")
+        app._schedule_autosave = lambda: calls.append("autosave")
+        app._refresh_all = lambda: calls.append("refresh")
+
+        app.toggle_current_bee_shadow_class()
+        self.assertEqual(rectangle_records(document)[0]["label"], "beeshadow")
+        self.assertEqual(rectangle_records(document)[0]["group_id"], 7)
+        self.assertEqual(keypoints_for_rectangle(document, 0)[0]["label"], "head")
+
+        app.toggle_current_bee_shadow_class()
+        self.assertEqual(rectangle_records(document)[0]["label"], "bee")
+        self.assertEqual(
+            calls,
+            ["undo", "dirty", "autosave", "refresh"] * 2,
+        )
+
+    def test_y_toggles_box_class_label_visibility(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.show_box_class_labels = FakeVariable()
+        app.show_box_class_labels.set(False)
+        app.status_var = FakeVariable()
+        calls = []
+        app._save_settings = lambda: calls.append("save")
+        app._refresh_all = lambda: calls.append("refresh")
+
+        app.toggle_box_class_labels()
+
+        self.assertTrue(app.show_box_class_labels.get())
+        self.assertEqual(calls, ["save", "refresh"])
+        self.assertIn("已显示", app.status_var.value)
+
+    def test_track_id_normalization_accepts_only_nonnegative_integers(self):
+        normalize = BeeKeypointAnnotator._normalize_track_id
+        self.assertEqual(normalize("12"), 12)
+        self.assertEqual(normalize(3.0), 3)
+        self.assertIsNone(normalize("1.5"))
+        self.assertIsNone(normalize(-1))
+        self.assertIsNone(normalize(True))
+
+    def test_continuous_mode_routes_r_and_e_to_new_workflow(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.continuous_annotation_mode = True
+        actions = []
+        app.begin_continuous_rectangle_drawing = lambda: actions.append("R")
+        app.copy_continuous_object_to_next = lambda: actions.append("E")
+
+        app.copy_current_frame_to_next()
+        app.next_rectangle()
+
+        self.assertEqual(actions, ["R", "E"])
+
+    def test_task_track_ids_are_unique_sorted_and_include_all_frames(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        first = Path("frame_001.jpg")
+        second = Path("frame_002.jpg")
+        app.images = [first, second]
+        app.documents = {
+            first: {"shapes": [rectangle("bee", 0, 0, 10, 10, group_id="9")]},
+            second: {
+                "shapes": [
+                    rectangle("bee", 0, 0, 10, 10, group_id=2),
+                    rectangle("bee", 20, 0, 30, 10, group_id=9),
+                ]
+            },
+        }
+
+        self.assertEqual(app._task_track_ids(), [2, 9])
+
+    def test_track_id_change_targets_follow_selected_time_direction(self):
+        first = Path("frame_001.jpg")
+        second = Path("frame_002.jpg")
+        third = Path("frame_003.jpg")
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.images = [first, second, third]
+        app.documents = {
+            first: {"shapes": [rectangle("bee", 0, 0, 10, 10, group_id=7)]},
+            second: {
+                "shapes": [
+                    rectangle("bee", 0, 0, 10, 10, group_id=8),
+                    rectangle("bee", 20, 0, 30, 10, group_id=7),
+                ]
+            },
+            third: {"shapes": [rectangle("bee", 0, 0, 10, 10, group_id=7)]},
+        }
+        app.current_image_index = 1
+        app._current_image_path = lambda: second
+
+        current = app._track_id_change_targets(7, 1, "current")
+        before = app._track_id_change_targets(7, 1, "before")
+        after = app._track_id_change_targets(7, 1, "after")
+
+        self.assertEqual(current, [(1, second, 1)])
+        self.assertEqual(before, [(0, first, 0), (1, second, 1)])
+        self.assertEqual(after, [(1, second, 1), (2, third, 0)])
+
+    def test_default_track_id_enter_applies_and_returns_focus_to_canvas(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.default_track_id_text = FakeVariable()
+        app.default_track_id_text.set("391")
+        app.default_track_id = None
+        focused = []
+        app.overview_canvas = type(
+            "Canvas", (), {"focus_set": lambda _self: focused.append(True)}
+        )()
+        app.root = type(
+            "Root", (), {"after_idle": lambda _self, callback: callback()}
+        )()
+        app.activate_default_track_id = lambda: setattr(app, "default_track_id", 391)
+        selection_cleared = []
+        widget = type(
+            "Widget",
+            (),
+            {"selection_clear": lambda _self: selection_cleared.append(True)},
+        )()
+        event = type("Event", (), {"widget": widget})()
+
+        result = app._activate_default_track_id_from_entry(event)
+
+        self.assertEqual(result, "break")
+        self.assertEqual(selection_cleared, [True])
+        self.assertEqual(focused, [True])
+
+    def test_next_new_track_id_uses_task_maximum_plus_one(self):
+        self.assertEqual(BeeKeypointAnnotator._next_new_track_id([]), 1)
+        self.assertEqual(BeeKeypointAnnotator._next_new_track_id([1, 4, 9]), 10)
+
+    def test_continuous_mode_ignores_current_selection_for_new_object_id(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        frame = Path("frame_001.jpg")
+        app.images = [frame]
+        app.documents = {
+            frame: {
+                "shapes": [
+                    rectangle("bee", 0, 0, 10, 10, group_id=1),
+                    rectangle("bee", 20, 0, 30, 10, group_id=9),
+                ]
+            }
+        }
+        app.continuous_annotation_mode = False
+        app.default_track_id = 1
+        app.default_track_id_explicit = False
+        app.default_track_id_text = FakeVariable()
+        app.status_var = FakeVariable()
+        app._current_group_id = lambda: 1
+        app._close_track_completion_dialog = lambda: None
+        app._refresh_track_mode_ui = lambda: None
+        app._set_image_index = lambda *_args, **_kwargs: None
+        app._align_continuous_view_to_current_frame = lambda: None
+
+        app.start_continuous_annotation_mode()
+
+        self.assertEqual(app.continuous_active_track_id, 10)
+        self.assertEqual(app.default_track_id_text.value, "10")
+
+    def test_continuous_mode_respects_explicit_manual_id(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        frame = Path("frame_001.jpg")
+        app.images = [frame]
+        app.documents = {
+            frame: {"shapes": [rectangle("bee", 0, 0, 10, 10, group_id=9)]}
+        }
+        app.continuous_annotation_mode = False
+        app.default_track_id = 4
+        app.default_track_id_explicit = True
+        app.default_track_id_text = FakeVariable()
+        app.status_var = FakeVariable()
+        app._close_track_completion_dialog = lambda: None
+        app._refresh_track_mode_ui = lambda: None
+        app._set_image_index = lambda *_args, **_kwargs: None
+        app._align_continuous_view_to_current_frame = lambda: None
+
+        app.start_continuous_annotation_mode()
+
+        self.assertEqual(app.continuous_active_track_id, 4)
+
+    def test_continuous_mode_can_switch_back_to_selected_default_id(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.track_id_mode = False
+        app.direction_review_mode = False
+        app.continuous_annotation_mode = True
+        app.continuous_active_track_id = 408
+        app.continuous_draw_box_mode = True
+        app.continuous_zoom_factor = 5.0
+        app.continuous_focus_point = (321.0, 456.0)
+        app.default_track_id = 408
+        app.default_track_id_explicit = False
+        app.default_track_id_text = FakeVariable()
+        app.default_track_id_text.set("406")
+        app.status_var = FakeVariable()
+        app.rectangle_creation = object()
+        app._refresh_default_track_id_controls = lambda: None
+        image_indices = []
+        app._set_image_index = lambda index, **_kwargs: image_indices.append(index)
+
+        app.activate_default_track_id()
+
+        self.assertEqual(app.continuous_active_track_id, 406)
+        self.assertEqual(app.default_track_id, 406)
+        self.assertTrue(app.default_track_id_explicit)
+        self.assertFalse(app.continuous_draw_box_mode)
+        self.assertEqual(app.continuous_zoom_factor, 5.0)
+        self.assertEqual(app.continuous_focus_point, (321.0, 456.0))
+        self.assertIsNone(app.rectangle_creation)
+        self.assertEqual(image_indices, [0])
+        self.assertIn("已切换到连续补标 ID 406", app.status_var.value)
+
+    def test_v_advances_to_new_unused_id_and_restarts_first_frame(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        frame = Path("frame_001.jpg")
+        app.images = [frame]
+        app.documents = {
+            frame: {"shapes": [rectangle("bee", 0, 0, 10, 10, group_id=405)]}
+        }
+        app.continuous_annotation_mode = True
+        app.continuous_active_track_id = 405
+        app.continuous_focus_point = (123.0, 234.0)
+        app.continuous_zoom_factor = 4.5
+        app.default_track_id = 405
+        app.default_track_id_explicit = True
+        app.default_track_id_text = FakeVariable()
+        app.status_var = FakeVariable()
+        app._close_track_completion_dialog = lambda: None
+        app._refresh_track_mode_ui = lambda: None
+        image_indices = []
+        app._set_image_index = lambda index, **_kwargs: image_indices.append(index)
+        app._align_continuous_view_to_current_frame = lambda: None
+
+        app.start_continuous_annotation_mode()
+
+        self.assertEqual(app.continuous_active_track_id, 406)
+        self.assertEqual(app.default_track_id, 406)
+        self.assertFalse(app.default_track_id_explicit)
+        self.assertEqual(app.default_track_id_text.value, "406")
+        self.assertEqual(image_indices, [0])
+        self.assertEqual(app.continuous_focus_point, (123.0, 234.0))
+        self.assertEqual(app.continuous_zoom_factor, 4.5)
+        self.assertIn("已切换到 ID 406", app.status_var.value)
+
+    def test_h_hides_all_boxes_including_current_and_keeps_keypoints(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.show_other_boxes = FakeVariable()
+        app.show_other_boxes.set(True)
+        app.status_var = FakeVariable()
+        refreshes = []
+        app._refresh_all = lambda: refreshes.append(True)
+
+        app.toggle_continuous_other_boxes()
+
+        self.assertFalse(app.show_other_boxes.get())
+        self.assertEqual(refreshes, [True])
+        self.assertIn("全部检测框（含当前框）已隐藏", app.status_var.value)
+        self.assertIn("关键点保持显示", app.status_var.value)
+
+    def test_b_toggles_box_id_labels(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.show_track_ids = FakeVariable()
+        app.show_track_ids.set(True)
+        app.status_var = FakeVariable()
+        refreshes = []
+        app._refresh_all = lambda: refreshes.append(True)
+
+        app.toggle_track_ids()
+
+        self.assertFalse(app.show_track_ids.get())
+        self.assertEqual(refreshes, [True])
+        self.assertEqual(app.status_var.value, "检测框 ID 已隐藏")
+
+    def test_continuous_mode_a_d_switch_adjacent_frames(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.continuous_annotation_mode = True
+        app.continuous_active_track_id = 404
+        app.images = [Path("1.jpg"), Path("2.jpg"), Path("3.jpg")]
+        app.current_image_index = 1
+        app.current_rectangle_index = 7
+        app.continuous_focus_point = (123.0, 456.0)
+        app.continuous_zoom_factor = 3.8
+        app.detail_cache_key = "old"
+        app.status_var = FakeVariable()
+        calls = []
+        app._set_image_index = lambda *args, **kwargs: calls.append((args, kwargs))
+        app._continuous_rectangle_position = lambda: -1
+        app._remember_current_rectangle = lambda: calls.append("remember")
+        app._refresh_all = lambda: calls.append("refresh")
+
+        app.next_track_frame()
+
+        self.assertEqual(calls[0][0][0], 2)
+        self.assertFalse(calls[0][1]["auto_confirm_viewed"])
+        self.assertEqual(calls[1], "refresh")
+        self.assertNotIn("remember", calls)
+        self.assertEqual(app.continuous_focus_point, (123.0, 456.0))
+        self.assertEqual(app.continuous_zoom_factor, 3.8)
+        self.assertEqual(app.current_rectangle_index, -1)
+        self.assertIsNone(app.detail_cache_key)
+        self.assertIn("第 3/3 帧", app.status_var.value)
+
+    def test_direction_review_q_e_w_routes_to_review_actions(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.direction_review_mode = True
+        actions = []
+        app.previous_direction_review_item = lambda: actions.append("previous")
+        app.confirm_direction_review_and_next = lambda: actions.append("confirm_next")
+        app.next_direction_review_item = lambda: actions.append("next")
+
+        app.previous_rectangle()
+        app.next_rectangle()
+        app.next_track_id()
+
+        self.assertEqual(actions, ["previous", "confirm_next", "next"])
 
     def test_legacy_image_shortcuts_are_migrated_to_track_navigation(self):
         app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
@@ -144,6 +828,18 @@ class ShortcutTests(unittest.TestCase):
         }
         shortcuts = app._load_shortcuts()
         self.assertEqual(shortcuts["copy_frame_to_next"], ["R", "无"])
+
+    def test_legacy_clear_id_shortcut_is_released_for_box_id_toggle(self):
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.settings = {
+            "shortcuts": {
+                "clear_default_track_id": ["V", "无"],
+            }
+        }
+        shortcuts = app._load_shortcuts()
+        self.assertEqual(shortcuts["start_continuous_annotation"], ["V", "无"])
+        self.assertEqual(shortcuts["toggle_track_ids"], ["B", "无"])
+        self.assertEqual(shortcuts["clear_default_track_id"], ["无", "无"])
 
     def test_default_shortcuts_have_no_conflicts(self):
         assigned = []
@@ -392,6 +1088,33 @@ class ShortcutTests(unittest.TestCase):
             )
             app._update_frame_completion_state(image_path, notify=True)
         showinfo.assert_called_once()
+
+    def test_continuous_mode_suppresses_frame_completion_notification(self):
+        document = self._rectangle_document()
+        add_or_replace_point(document, 0, "head", (2, 4))
+        add_or_replace_point(document, 0, "tail", (8, 16))
+        image_path = Path("complete.jpg")
+
+        class ImmediateRoot:
+            @staticmethod
+            def after_idle(callback):
+                callback()
+
+        app = BeeKeypointAnnotator.__new__(BeeKeypointAnnotator)
+        app.root = ImmediateRoot()
+        app.continuous_annotation_mode = True
+        app.images = [image_path]
+        app.current_image_index = 0
+        app.documents = {image_path: document}
+        app.frame_completion_state = {image_path: False}
+
+        with patch("app.messagebox.showinfo") as showinfo:
+            self.assertTrue(
+                app._update_frame_completion_state(image_path, notify=True)
+            )
+
+        showinfo.assert_not_called()
+        self.assertTrue(app.frame_completion_state[image_path])
 
     @staticmethod
     def _track_document(group_id, rect=(0, 0, 10, 20)):
